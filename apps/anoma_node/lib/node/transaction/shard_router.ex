@@ -2,14 +2,14 @@ defmodule Anoma.Node.Transaction.ShardRouter do
   @moduledoc """
   I am a GenServer responsible for routing requests to the correct Shard.
 
-  Currently, my primary responsibility is to look up the registered name
+  My primary responsibility is to look up the registered name
   of the shard responsible for a given key using the shared `:shard_key_map` ETS table.
   This table is populated by the `Anoma.Node.Transaction.ShardSupervisor`.
 
   ### Public API
 
   - `start_link/1`: I start the router GenServer.
-  - `get_shard_name/1`: I look up the shard name for a key.
+  - `get_shard_label/1`: I look up the shard label for a key.
   """
 
   use GenServer
@@ -25,10 +25,6 @@ defmodule Anoma.Node.Transaction.ShardRouter do
   @typedoc "I represent a key managed by a shard."
   @type key_t :: binary()
 
-  @typedoc "I am the name used to register a shard process via Registry."
-  @type shard_registry_name_t ::
-          {:via, Registry, {module(), {module(), key_t()}}}
-
   @typedoc "I am the arguments passed to start_link. Requires node_id."
   @type args_t :: [node_id: String.t()]
 
@@ -36,7 +32,7 @@ defmodule Anoma.Node.Transaction.ShardRouter do
   #                       Constants                          #
   ############################################################
 
-  # The ETS table is created and owned by the ShardSupervisor, but we read from it.
+  # The ETS table is created and owned by the ShardSupervisor, but I read from it.
   @ets_table_name :shard_key_map
 
   ############################################################
@@ -50,24 +46,21 @@ defmodule Anoma.Node.Transaction.ShardRouter do
   """
   @spec start_link(args :: args_t()) :: GenServer.on_start()
   def start_link(args) do
-    node_id = Keyword.fetch!(args, :node_id)
-    # Use (node_id, Module) for registration as per Dialyzer spec
-    name = Registry.via(node_id, __MODULE__)
+    name = Registry.via(args[:node_id], __MODULE__)
     GenServer.start_link(__MODULE__, args, name: name)
   end
 
   @doc """
-  I retrieve the registered name of the shard responsible for the given key.
+  I retrieve the label (atom) of the shard responsible for the given key.
 
   I make a synchronous call to my GenServer process to perform the lookup
   in the ETS table (`:shard_key_map`).
-  I return `{:ok, shard_registry_name}` if the key is found, otherwise `:error`.
+  I return `{:ok, shard_label}` if the key is found, otherwise `:error`.
   """
-  @spec get_shard_name(key :: key_t()) ::
-          {:ok, shard_registry_name_t()} | :error
-  def get_shard_name(key) when is_binary(key) do
-    # Call self - the GenServer registered under __MODULE__ name
-    GenServer.call(__MODULE__, {:get_shard_name, key})
+  @spec get_shard_label(key :: key_t()) ::
+          {:ok, atom()} | :error
+  def get_shard_label(key) when is_binary(key) do
+    GenServer.call(__MODULE__, {:get_shard_label, key})
   end
 
   ############################################################
@@ -88,23 +81,20 @@ defmodule Anoma.Node.Transaction.ShardRouter do
 
   @impl true
   @doc """
-  I handle the `:get_shard_name` request.
+  I handle the `:get_shard_label` request.
 
   I perform the lookup in the shared `:shard_key_map` ETS table.
+  I return the shard label (atom) stored in the table.
   """
-  @spec handle_call({:get_shard_name, key_t()}, GenServer.from(), :no_state) ::
-          {:reply, {:ok, shard_registry_name_t()} | :error, :no_state}
-  def handle_call({:get_shard_name, key}, _from, state) do
+  @spec handle_call({:get_shard_label, key_t()}, GenServer.from(), :no_state) ::
+          {:reply, {:ok, atom()} | :error, :no_state}
+  def handle_call({:get_shard_label, key}, _from, state) do
     try do
       lookup_result = :ets.lookup(@ets_table_name, key)
 
-      Logger.debug(
-        "ShardRouter: ETS lookup for key #{inspect(key)} returned: #{inspect(lookup_result)}"
-      )
-
       reply =
         case lookup_result do
-          [{^key, shard_name}] -> {:ok, shard_name}
+          [{^key, shard_id}] -> {:ok, shard_id}
           [] -> :error
         end
 
@@ -115,8 +105,17 @@ defmodule Anoma.Node.Transaction.ShardRouter do
           "ShardRouter: Error during ETS lookup for key #{inspect(key)} - Kind: #{kind}, Reason: #{inspect(reason)}, Stacktrace: #{inspect(__STACKTRACE__)}"
         )
 
-        # Reply with error if ETS fails unexpectedly
         {:reply, :error, state}
     end
+  end
+
+  @impl true
+  @doc """
+  I clean up the ETS table when I (the router) terminate.
+  """
+  @spec terminate(reason :: any(), state :: :no_state) :: :ok
+  def terminate(_reason, _state) do
+    :ets.delete(@ets_table_name)
+    :ok
   end
 end

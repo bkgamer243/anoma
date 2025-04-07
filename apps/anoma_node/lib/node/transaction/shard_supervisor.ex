@@ -39,7 +39,7 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
 
   @typedoc """
   I am the schema defining the keys and their initial values for shards.
-  For `:one_per_key` strategy, I expect a list containing either `key` binaries
+  For the `:one_per_key` strategy, I expect a list containing either `key` binaries
   or `{key, initial_value}` tuples. If only a key is provided, there is no
   initial value.
   """
@@ -61,7 +61,10 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
           schema: schema_t() | nil
         ]
 
-  @typedoc "I am the type of the arguments that the Shard process expects."
+  @typedoc """
+  I am the type of the arguments that the Shard process expects.
+  I am not explicitly used, but this may be useful to know.
+  """
   @type shard_args_t :: [
           id: key_t(),
           initial_kv: %{key_t() => initial_value_t()}
@@ -85,7 +88,6 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
   """
   @spec start_link(args :: supervisor_args_t()) :: Supervisor.on_start()
   def start_link(args) do
-    # Use node_id for registration
     name = Registry.via(args[:node_id], __MODULE__)
     Supervisor.start_link(__MODULE__, args, name: name)
   end
@@ -107,17 +109,16 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
     Process.set_label({__MODULE__, node_id})
 
     # Process schema only if strategy and schema are validly provided
-    {shard_child_specs, key_to_name_map} =
+    {shard_child_specs, key_to_id_map} =
       case {Keyword.get(args, :strategy), Keyword.get(args, :schema)} do
         {:one_per_key, schema} when is_list(schema) ->
-          # Iterate schema once to build specs and key->name map
+          # Iterate schema once to build specs and key->id map
           Enum.reduce(schema, {[], %{}}, fn schema_entry,
                                             {specs_acc, map_acc} ->
             case schema_entry do
               # Case 1: Schema entry is {key, initial_value}
               {key, initial_value} when is_binary(key) ->
                 shard_id = String.to_atom(key)
-                shard_name = Registry.via(node_id, Shard, shard_id)
 
                 shard_args = [
                   node_id: node_id,
@@ -130,12 +131,11 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
                   start: {Shard, :start_link, [shard_args]}
                 }
 
-                {[child_spec | specs_acc], Map.put(map_acc, key, shard_name)}
+                {[child_spec | specs_acc], Map.put(map_acc, key, shard_id)}
 
               # Case 2: Schema entry is just a key
               key when is_binary(key) ->
                 shard_id = String.to_atom(key)
-                shard_name = Registry.via(node_id, Shard, shard_id)
                 shard_args = [node_id: node_id, id: shard_id, initial_kv: %{}]
 
                 child_spec = %{
@@ -143,15 +143,13 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
                   start: {Shard, :start_link, [shard_args]}
                 }
 
-                {[child_spec | specs_acc], Map.put(map_acc, key, shard_name)}
+                {[child_spec | specs_acc], Map.put(map_acc, key, shard_id)}
 
               _invalid_entry ->
                 # Skip invalid entry
                 {specs_acc, map_acc}
             end
           end)
-          # Reverse specs for order
-          |> then(fn {specs, map} -> {Enum.reverse(specs), map} end)
 
         {nil, _} ->
           {[], %{}}
@@ -163,8 +161,8 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
           {[], %{}}
       end
 
-    # Create and populate ETS table if shards were generated
-    if map_size(key_to_name_map) > 0 do
+    # Create and populate ETS table (mapping key -> shard_id) if shards were generated
+    if map_size(key_to_id_map) > 0 do
       ets_table =
         :ets.new(@ets_table_name, [
           :set,
@@ -175,8 +173,8 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
 
       # Verify table creation/access and log insertions
       if :ets.info(ets_table, :name) == @ets_table_name do
-        for {key, name} <- key_to_name_map do
-          :ets.insert(ets_table, {key, name})
+        for {key, shard_id} <- key_to_id_map do
+          :ets.insert(ets_table, {key, shard_id})
         end
       end
 
@@ -190,12 +188,4 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
       Supervisor.init([], strategy: :one_for_one)
     end
   end
-
-  ############################################################
-  #                       Public API                         #
-  ############################################################
-
-  ############################################################
-  #                    Private Helpers                       #
-  ############################################################
 end

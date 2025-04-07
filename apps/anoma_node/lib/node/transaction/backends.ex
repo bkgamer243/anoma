@@ -18,6 +18,7 @@ defmodule Anoma.Node.Transaction.Backends do
   alias Anoma.Node.Transaction.Executor
   alias Anoma.Node.Transaction.Ordering
   alias Anoma.Node.Transaction.Storage
+  alias Anoma.Node.Transaction.Shard
   alias Anoma.TransparentResource
   alias Anoma.TransparentResource.Resource, as: TResource
   alias Anoma.TransparentResource.Transaction, as: TTransaction
@@ -36,6 +37,7 @@ defmodule Anoma.Node.Transaction.Backends do
           | :debug_bloblike
           | :transparent_resource
           | :cairo_resource
+          | :shard_storage
 
   @type transaction() :: {backend(), Noun.t() | binary()}
 
@@ -143,52 +145,196 @@ defmodule Anoma.Node.Transaction.Backends do
              node_id: String.t(),
              back: backend()
   def execute(node_id, {backend, tx_code}, id) do
-    time = Storage.current_time(node_id)
+    if backend == :shard_storage do
+      execute_shard_storage(node_id, tx_code, id, backend)
+    else
+      # For non-shard backends
+      time = Storage.current_time(node_id)
 
-    scry =
-      fn list ->
-        if list do
-          with [id, key] <- list |> Noun.list_nock_to_erlang(),
-               {:ok, value} <-
-                 (case backend do
-                    {:read_only, _pid} ->
-                      Storage.read(
-                        node_id,
-                        {time, key |> Noun.list_nock_to_erlang()}
-                      )
+      scry =
+        fn list ->
+          if list do
+            with [id, key] <- list |> Noun.list_nock_to_erlang(),
+                 {:ok, value} <-
+                   (case backend do
+                      {:read_only, _pid} ->
+                        Storage.read(
+                          node_id,
+                          {time, key |> Noun.list_nock_to_erlang()}
+                        )
 
-                    _ ->
-                      Ordering.read(
-                        node_id,
-                        {id, key |> Noun.list_nock_to_erlang()}
-                      )
-                  end) do
-            {:ok, value}
+                      _ ->
+                        Ordering.read(
+                          node_id,
+                          {id, key |> Noun.list_nock_to_erlang()}
+                        )
+                    end) do
+              {:ok, value}
+            else
+              _ -> :error
+            end
           else
-            _ -> :error
+            :error
           end
-        else
-          :error
         end
-      end
 
-    env = %Nock{scry_function: scry}
-    vm_result = vm_execute(tx_code, env, id)
-    result_event(id, vm_result, node_id, backend)
+      env = %Nock{scry_function: scry}
 
-    res =
-      with {:ok, vm_res} <- vm_result,
-           {:ok, backend_res} <-
-             backend_logic(backend, node_id, id, vm_res, time: time) do
-        {:ok, backend_res}
-      else
-        _e ->
-          empty_write(backend, node_id, id)
+      vm_result = vm_execute(tx_code, env, id)
+      result_event(id, vm_result, node_id, backend)
 
-          :error
-      end
+      res =
+        with {:ok, vm_res} <- vm_result,
+             {:ok, backend_res} <-
+               backend_logic(backend, node_id, id, vm_res, time: time) do
+          {:ok, backend_res}
+        else
+          _e ->
+            empty_write(backend, node_id, id)
 
-    complete_event(id, res, node_id, backend)
+            :error
+        end
+
+      complete_event(id, res, node_id, backend)
+    end
+  end
+
+  # Execute transaction using the shard storage backend
+  @spec execute_shard_storage(
+          String.t(),
+          Noun.t(),
+          binary(),
+          backend()
+        ) :: :ok
+  defp execute_shard_storage(node_id, tx_code, id, backend) do
+    # For shard storage, first extract reservations
+    case vm_execute_stage1(tx_code) do
+      {:ok, {stage_2_tx, reservations}} ->
+        case parse_reservations(reservations) do
+          {:ok, parsed_reservations} ->
+            # Request reservations from Ordering
+            case Ordering.request_reservations(
+                   node_id,
+                   id,
+                   parsed_reservations
+                 ) do
+              {:ok, {height, shard_pids}} ->
+                # Update scry function with height
+                # Nock VM passes the evaluated key noun directly to the scry function
+                shard_scry =
+                  fn key_noun ->
+                    binary_key = Noun.atom_integer_to_binary(key_noun)
+
+                    case Map.fetch(shard_pids, binary_key) do
+                      {:ok, pid} ->
+                        case Shard.read(
+                               pid,
+                               binary_key,
+                               height
+                             ) do
+                          {:ok, value} -> {:ok, value}
+                          :absent -> :absent
+                          _ -> :error
+                        end
+
+                      :error ->
+                        :error
+                    end
+                  end
+
+                shard_env = %Nock{scry_function: shard_scry}
+
+                # Execute the rest with reservations
+                vm_result = vm_execute_stage2(stage_2_tx, id, shard_env)
+                result_event(id, vm_result, node_id, backend)
+
+                # Process the result and handle completion/failure notification
+                res =
+                  case vm_result do
+                    {:ok, vm_res} ->
+                      # Try to store the result using shard logic
+                      case shard_storage_logic(
+                             node_id,
+                             id,
+                             vm_res,
+                             height,
+                             shard_pids
+                           ) do
+                        {:ok, backend_res} ->
+                          Ordering.transaction_completed(
+                            node_id,
+                            id
+                          )
+
+                          {:ok, backend_res}
+
+                        :error ->
+                          # Shard logic failed
+                          # Do not call transaction_failed here, it was done in shard_storage_logic
+                          :error
+                      end
+
+                    :vm_error ->
+                      # VM stage 2 failed
+                      Logging.log_event(
+                        node_id,
+                        :error,
+                        "Transaction #{inspect(id)} failed: VM execution stage 2 error."
+                      )
+
+                      Ordering.transaction_failed(
+                        node_id,
+                        id
+                      )
+
+                      :error
+                  end
+
+                # end case vm_result
+
+                # Notify Executor about the final result (:ok/:error)
+                complete_event(id, res, node_id, backend)
+
+                :ok
+
+              {:error, reason} ->
+                # Reservation failed
+                Logging.log_event(
+                  node_id,
+                  :error,
+                  "Transaction #{inspect(id)} failed: Could not acquire reservations. Reason: #{inspect(reason)}"
+                )
+
+                # No need to call transaction_failed here
+                # as Ordering handles failed reservation attempts internally.
+                # Tell mempool VM step failed
+                result_event(id, :vm_error, node_id, backend)
+                # Tell executor overall failed
+                complete_event(id, :error, node_id, backend)
+                :ok
+            end
+
+          {:error, reason} ->
+            # Invalid reservation format
+            # No need to call transaction_failed here
+            # as no reservations were successfully acquired
+            Logging.log_event(
+              node_id,
+              :error,
+              "Invalid reservation format: #{inspect(reason)}"
+            )
+
+            result_event(id, :vm_error, node_id, backend)
+            complete_event(id, :error, node_id, backend)
+        end
+
+      _error ->
+        # Stage 1 execution failed
+        # No need to call transaction_failed here
+        # as no reservations were successfully acquired
+        result_event(id, :vm_error, node_id, backend)
+        complete_event(id, :error, node_id, backend)
+    end
   end
 
   ############################################################
@@ -205,6 +351,101 @@ defmodule Anoma.Node.Transaction.Backends do
       {:ok, result}
     else
       _e -> :vm_error
+    end
+  end
+
+  # First stage of VM execution - extracts reservations
+  @spec vm_execute_stage1(Noun.t()) ::
+          {:ok, {Noun.t(), Noun.t()}} | :vm_error
+  defp vm_execute_stage1(tx_code) do
+    with {:ok, code} <- cue_when_atom(tx_code),
+         {:ok, [reservations | stage_2_tx]} <-
+           nock(code, [9, 2, 0 | 1], %Nock{}) do
+      {:ok, {stage_2_tx, reservations}}
+    else
+      _e -> :vm_error
+    end
+  end
+
+  # Second stage of VM execution - called after reservation acquisition
+  @spec vm_execute_stage2(Noun.t(), binary(), Nock.t()) ::
+          {:ok, Noun.t()} | :vm_error
+  defp vm_execute_stage2(stage_2_tx, id, env) do
+    with {:ok, ordered_tx} <- nock(stage_2_tx, [10, [6, 1 | id], 0 | 1], env),
+         {:ok, result} <- nock(ordered_tx, [9, 2, 0 | 1], env) do
+      {:ok, result}
+    else
+      _e -> :vm_error
+    end
+  end
+
+  @doc """
+  I parse the reservations list from the transaction, expecting an improper list structure.
+
+  I return a list of read/write access requests for specific keys.
+  I handle formats like `[[0 | key_a] | [1 | key_b]]` or `[0 | key_a]`.
+  """
+  @spec parse_reservations(Noun.t()) ::
+          {:ok, [{:read | :write, binary()}]} | {:error, atom()}
+  def parse_reservations(reservations) do
+    do_parse_reservations(reservations, [])
+  end
+
+  # Helper for parsing reservation lists recursively
+  @spec do_parse_reservations(Noun.t(), [{:read | :write, binary()}]) ::
+          {:ok, [{:read | :write, binary()}]} | {:error, atom()}
+  defp do_parse_reservations(noun, acc) do
+    case noun do
+      # --- Standard list terminators ---
+      0 ->
+        {:ok, Enum.reverse(acc)}
+
+      [] ->
+        {:ok, Enum.reverse(acc)}
+
+      <<>> ->
+        {:ok, Enum.reverse(acc)}
+
+      # --- Recursive case: [ [type | key] | rest ] ---
+      [[type_num | key_noun] = head | rest] ->
+        case process_reservation_pair(type_num, key_noun) do
+          {:ok, reservation} ->
+            do_parse_reservations(rest, [reservation | acc])
+
+          {:error, reason} ->
+            {:error,
+             {:invalid_reservation_pair_format,
+              {reason, Noun.condensed_print(head)}}}
+        end
+
+      # --- Base case: Single pair [type | key] (end of improper list) ---
+      [type_num | key_noun] = pair ->
+        case process_reservation_pair(type_num, key_noun) do
+          {:ok, reservation} ->
+            {:ok, Enum.reverse([reservation | acc])}
+
+          {:error, reason} ->
+            {:error,
+             {:invalid_reservation_pair_format,
+              {reason, Noun.condensed_print(pair)}}}
+        end
+
+      # --- Invalid format ---
+      _invalid ->
+        {:error, :invalid_reservation_format}
+    end
+  end
+
+  # Processes a single [type | key] pair from the reservation list
+  @spec process_reservation_pair(Noun.t(), Noun.t()) ::
+          {:ok, {:read | :write, binary()}} | {:error, atom}
+  defp process_reservation_pair(type_num, key_noun) do
+    key_bin = Noun.atom_integer_to_binary(key_noun)
+
+    case type_num do
+      0 -> {:ok, {:read, key_bin}}
+      1 -> {:ok, {:write, key_bin}}
+      _ -> {:error, :invalid_reservation_type}
     end
   end
 
@@ -241,6 +482,120 @@ defmodule Anoma.Node.Transaction.Backends do
 
   defp backend_logic(:cairo_resource, node_id, id, vm_res, _opts) do
     cairo_resource_tx(node_id, id, vm_res)
+  end
+
+  defp backend_logic(:shard_storage, _node_id, _id, _vm_res, _opts) do
+    # This is handled directly in execute/3 when requesting reservations
+    {:error, :unexpected_backend_logic_call}
+  end
+
+  # Handle shard storage transactions after vm execution
+  # Expects result to be an improper list of [key | value] pairs.
+  @spec shard_storage_logic(String.t(), binary(), Noun.t(), integer(), %{
+          binary() => pid()
+        }) ::
+          {:ok, any()} | :error
+  defp shard_storage_logic(node_id, id, result_noun, height, shard_pids) do
+    # Parse the improper list of write operations
+    case parse_writes(result_noun) do
+      {:ok, kvlist} ->
+        # Try writing to shards, track failures
+        write_results =
+          Enum.map(kvlist, fn {k_noun, v_noun} ->
+            key_bin = Noun.atom_integer_to_binary(k_noun)
+
+            case Map.fetch(shard_pids, key_bin) do
+              {:ok, pid} ->
+                case Shard.write(pid, key_bin, v_noun, height) do
+                  :ok ->
+                    {:ok, key_bin}
+
+                  {:error, reason} ->
+                    {:error, {key_bin, :write_failed, reason}}
+                end
+
+              :error ->
+                # Key not found in reserved pids (shouldn't happen if reservation succeeded)
+                {:error, {key_bin, :pid_not_found}}
+            end
+          end)
+
+        # Check if any writes failed
+        failed_writes =
+          Enum.filter(write_results, fn {status, _} -> status == :error end)
+
+        if Enum.empty?(failed_writes) do
+          # All writes succeeded
+          # Return original noun on success
+          {:ok, result_noun}
+        else
+          # Log detailed errors for each failure
+          Enum.each(failed_writes, fn
+            {:error, {key, :write_failed, reason}} ->
+              Logging.log_event(
+                node_id,
+                :error,
+                "Shard write failed for tx #{inspect(id)}, key #{inspect(key)}: Write error - #{inspect(reason)}"
+              )
+
+            {:error, {key, :pid_not_found}} ->
+              Logging.log_event(
+                node_id,
+                :error,
+                "Shard write failed for tx #{inspect(id)}, key #{inspect(key)}: Shard PID not found in reservations"
+              )
+          end)
+
+          # Notify Ordering transaction failed - IMPORTANT
+          Ordering.transaction_failed(node_id, id)
+          :error
+        end
+    end
+
+    # end case parse_writes
+  end
+
+  # Helper to parse an improper list of [key | value] writes.
+  @spec parse_writes(Noun.t()) ::
+          {:ok, [{Noun.t(), Noun.t()}]} | {:error, atom}
+  defp parse_writes(noun) do
+    do_parse_writes(noun, [])
+  end
+
+  @spec do_parse_writes(Noun.t(), [{Noun.t(), Noun.t()}]) ::
+          {:ok, [{Noun.t(), Noun.t()}]} | {:error, atom}
+  defp do_parse_writes(noun, acc) do
+    case noun do
+      # Base cases: Common list terminators
+      0 ->
+        {:ok, Enum.reverse(acc)}
+
+      [] ->
+        {:ok, Enum.reverse(acc)}
+
+      <<>> ->
+        {:ok, Enum.reverse(acc)}
+
+      # Recursive case: [ [key | value] | rest ]
+      [[key_noun | value_noun] = head | rest] ->
+        if Noun.is_noun_atom(key_noun) and not is_list(value_noun) do
+          do_parse_writes(rest, [{key_noun, value_noun} | acc])
+        else
+          {:error, {:invalid_write_pair_format, Noun.condensed_print(head)}}
+        end
+
+      # Base case: Single write [key | value] or improper list end
+      [key_noun | value_noun] = pair ->
+        # Basic validation similar to the recursive case
+        if Noun.is_noun_atom(key_noun) and not is_list(value_noun) do
+          {:ok, Enum.reverse([{key_noun, value_noun} | acc])}
+        else
+          {:error, {:invalid_write_pair_format, Noun.condensed_print(pair)}}
+        end
+
+      _ ->
+        {:error, {:invalid_write_format, Noun.condensed_print(noun)}}
+    end
   end
 
   @spec transparent_resource_tx(String.t(), binary(), Noun.t()) ::
@@ -508,6 +863,10 @@ defmodule Anoma.Node.Transaction.Backends do
 
   @spec empty_write(backend(), String.t(), binary()) :: :ok
   defp empty_write({:read_only, _}, _node_id, _id) do
+    :ok
+  end
+
+  defp empty_write(:shard_storage, _node_id, _id) do
     :ok
   end
 
