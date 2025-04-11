@@ -866,9 +866,7 @@ defmodule Anoma.Node.Transaction.Ordering do
   # Helper to get the PID of the shard responsible for a key.
   @spec get_shard_pid(String.t(), binary()) :: {:ok, pid()} | :error
   defp get_shard_pid(node_id, key) do
-    router_via_name = Registry.via(node_id, ShardRouter)
-    # Call ShardRouter with a timeout
-    case GenServer.call(router_via_name, {:get_shard_label, key}, 5000) do
+    case ShardRouter.get_shard_label(node_id, key) do
       {:ok, shard_label} when is_atom(shard_label) ->
         # Found label, now find the registered Shard PID
         case Registry.whereis(node_id, Shard, shard_label) do
@@ -882,20 +880,6 @@ defmodule Anoma.Node.Transaction.Ordering do
           pid ->
             {:ok, pid}
         end
-
-      {:error, :timeout} ->
-        Logger.error(
-          "ShardRouter :get_shard_label call timed out for key #{inspect(key)}"
-        )
-
-        :error
-
-      {:error, reason} ->
-        Logger.error(
-          "ShardRouter :get_shard_label call failed for key #{inspect(key)} with reason: #{inspect(reason)}"
-        )
-
-        :error
 
       other ->
         Logger.error(

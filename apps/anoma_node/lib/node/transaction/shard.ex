@@ -112,7 +112,15 @@ defmodule Anoma.Node.Transaction.Shard do
   end
 
   @doc """
-  I am the reserve function for the Shard module.
+  I am the reserve function for the Shard module. Use me to reserve a
+  read or write at a specific key at a specific height.
+
+  Reservations exist to inform the KV store that a value will
+  be read or written at a specific height at some point in the future.
+  If I know that an empty entry will be written to, then an immediate read
+  will have to wait until the write occurs. If I know that some entry will
+  be read from, then I know I must keep around immediately preceding committed values at
+  least until the read is completed.
 
   I request a reservation on a specific key at a given height.
   Capabilities can be `:read`, `:write`, or `:read_write`.
@@ -179,7 +187,7 @@ defmodule Anoma.Node.Transaction.Shard do
   end
 
   ############################################################
-  #                    Genserver Helpers                     #
+  #                    Genserver Callbacks                    #
   ############################################################
 
   @impl true
@@ -231,92 +239,139 @@ defmodule Anoma.Node.Transaction.Shard do
     {:ok, state}
   end
 
-  ############################################################
-  #                   Genserver Callbacks                    #
-  ############################################################
-
   # --- Reservation Handling ---
   @impl true
   def handle_call({:reserve, key, height, type}, _from, state) do
-    key_watermarks = Map.get(state.watermarks, key, %{read: -1, write: -1})
-
-    # Check against watermarks based on requested reservation type
-    cond do
-      # Cannot acquire WRITE reservation at or below the WRITE watermark
-      type in [:write, :read_write] and height <= key_watermarks.write ->
-        {:reply, {:error, :reserving_write_under_write_watermark}, state}
-
-      # Cannot acquire READ reservation at or below the READ watermark
-      type in [:read, :read_write] and height <= key_watermarks.read ->
-        {:reply, {:error, :reserving_read_under_read_watermark}, state}
-
-      # Height is valid relative to relevant watermarks, proceed
-      true ->
-        key_height_map = Map.get(state.kv, key, %{})
-        # Get current details or default to empty
-        details =
-          Map.get(key_height_map, height, %{
-            value: nil,
-            read_reserved?: false,
-            write_reserved?: false
-          })
-
-        # Process Read Reservation Request
-        details_after_read =
-          if type in [:read, :read_write] and !details.read_reserved? do
-            # Grant read reservation
-            %{details | read_reserved?: true}
-          else
-            # Either not requested, or already reserved
-            details
-          end
-
-        # Process Write Reservation Request
-        {details_after_write, error} =
-          cond do
-            type not in [:write, :read_write] ->
-              # Write not requested
-              {details_after_read, nil}
-
-            not is_nil(details_after_read.value) ->
-              # Cannot acquire write reservation if value already exists
-              {details_after_read, :slot_occupied_by_value}
-
-            not details_after_read.write_reserved? ->
-              # Acquire new write reservation
-              {%{details_after_read | write_reserved?: true}, nil}
-
-            true ->
-              # Write reservation already held
-              {details_after_read, nil}
-          end
-
-        if error do
-          # Primarily handles :slot_occupied_by_value for write attempts
-          {:reply, {:error, error}, state}
-        else
-          # Update state only if changes occurred
-          final_details = details_after_write
-
-          if final_details != details do
-            new_key_height_map =
-              Map.put(key_height_map, height, final_details)
-
-            new_kv = Map.put(state.kv, key, new_key_height_map)
-            new_state = %{state | kv: new_kv}
-
-            {:reply, :ok, new_state}
-          else
-            # No change in reservation status (e.g., reservations already held)
-            {:reply, :ok, state}
-          end
-        end
-    end
+    handle_reserve(key, height, type, state)
   end
 
   # --- Write Handling ---
   @impl true
   def handle_call({:write, key, value, height}, _from, state) do
+    handle_write(key, value, height, state)
+  end
+
+  # --- Read Handling ---
+  @impl true
+  def handle_call({:read, key, height_req}, from, state) do
+    handle_read(key, height_req, from, state)
+  end
+
+  # --- Watermark Update Handling ---
+  @impl true
+  def handle_info({:write_watermark_advanced, key, h_write}, state) do
+    handle_write_watermark_advanced(key, h_write, state)
+  end
+
+  @impl true
+  def handle_info({:read_watermark_advanced, key, h_read}, state) do
+    handle_read_watermark_advanced(key, h_read, state)
+  end
+
+  # --- Unreserve Handling ---
+  @impl true
+  def handle_cast({:unreserve, height}, state) do
+    handle_unreserve(height, state)
+  end
+
+  ############################################################
+  #             Internal Callback Handler Functions          #
+  ############################################################
+
+  # Handles the `:reserve` GenServer call.
+
+  # Orchestrates the reservation process using helper functions and a `with` statement.
+  # 1. Checks watermarks.
+  # 2. Retrieves or initializes details for the {key, height}.
+  # 3. Processes the specific reservation request (:read, :write, or :read_write).
+  # 4. Updates the state if the reservation was successful and changed the details.
+  @spec handle_reserve(key(), height(), capabilities(), __MODULE__.t()) ::
+          {:reply, :ok | {:error, atom()}, __MODULE__.t()}
+  defp handle_reserve(key, height, type, state) do
+    key_watermarks = Map.get(state.watermarks, key, %{read: -1, write: -1})
+
+    with :ok <- check_watermarks(height, type, key_watermarks),
+         original_details = get_or_initialize_details(state.kv, key, height),
+         {:ok, final_details} <-
+           process_reservation_request(type, original_details) do
+      # Update state only if changes occurred
+      if final_details != original_details do
+        key_height_map = Map.get(state.kv, key, %{})
+        new_key_height_map = Map.put(key_height_map, height, final_details)
+        new_kv = Map.put(state.kv, key, new_key_height_map)
+        new_state = %{state | kv: new_kv}
+        {:reply, :ok, new_state}
+      else
+        # No change in reservation status (e.g., reservations already held)
+        {:reply, :ok, state}
+      end
+    else
+      # Handle errors from check_watermarks or process_reservation_request
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  # Checks if a reservation request conflicts with existing watermarks.
+  @spec check_watermarks(height(), capabilities(), map()) ::
+          :ok | {:error, atom()}
+  defp check_watermarks(height, type, key_watermarks)
+       when type in [:write, :read_write] and height <= key_watermarks.write do
+    {:error, :reserving_write_under_write_watermark}
+  end
+
+  defp check_watermarks(height, type, key_watermarks)
+       when type in [:read, :read_write] and height <= key_watermarks.read do
+    {:error, :reserving_read_under_read_watermark}
+  end
+
+  defp check_watermarks(_height, _type, _key_watermarks), do: :ok
+
+  # Retrieves the kv_entry_details for a {key, height} or returns initial default details.
+  @spec get_or_initialize_details(map(), key(), height()) ::
+          kv_entry_details()
+  defp get_or_initialize_details(kv, key, height) do
+    kv
+    |> Map.get(key, %{})
+    |> Map.get(height, %{
+      value: nil,
+      read_reserved?: false,
+      write_reserved?: false
+    })
+  end
+
+  # Processes a reservation request based on the type and current details.
+
+  # Handles granting read/write reservations and checks for conflicts like existing values
+  # when attempting a write reservation. Uses function heads for clarity.
+  @spec process_reservation_request(capabilities(), kv_entry_details()) ::
+          {:ok, kv_entry_details()} | {:error, atom()}
+
+  defp process_reservation_request(:read, details) do
+    {:ok, %{details | read_reserved?: true}}
+  end
+
+  defp process_reservation_request(:write, %{value: value})
+       when not is_nil(value) do
+    {:error, :slot_occupied_by_value}
+  end
+
+  defp process_reservation_request(:write, details) do
+    {:ok, %{details | write_reserved?: true}}
+  end
+
+  defp process_reservation_request(:read_write, %{value: value})
+       when not is_nil(value) do
+    {:error, :slot_occupied_by_value}
+  end
+
+  defp process_reservation_request(:read_write, details) do
+    {:ok, %{details | read_reserved?: true, write_reserved?: true}}
+  end
+
+  @spec handle_write(key(), value(), height(), __MODULE__.t()) ::
+          {:reply, :ok | {:error, atom()}, __MODULE__.t()}
+  defp handle_write(key, value, height, state) do
     key_height_map = Map.get(state.kv, key, %{})
 
     details =
@@ -344,9 +399,11 @@ defmodule Anoma.Node.Transaction.Shard do
     end
   end
 
-  # --- Read Handling ---
-  @impl true
-  def handle_call({:read, key, height_req}, from, state) do
+  @spec handle_read(key(), height(), GenServer.from(), __MODULE__.t()) ::
+          {:reply, {:ok, value()} | :absent | {:error, atom()},
+           __MODULE__.t()}
+          | {:noreply, __MODULE__.t()}
+  defp handle_read(key, height_req, from, state) do
     # --- Validation ---
     key_height_map = Map.get(state.kv, key, %{})
 
@@ -418,9 +475,9 @@ defmodule Anoma.Node.Transaction.Shard do
     end
   end
 
-  # --- Watermark Update Handling ---
-  @impl true
-  def handle_info({:write_watermark_advanced, key, h_write}, state) do
+  @spec handle_write_watermark_advanced(key(), height(), __MODULE__.t()) ::
+          {:noreply, __MODULE__.t()}
+  defp handle_write_watermark_advanced(key, h_write, state) do
     current_key_watermarks =
       Map.get(state.watermarks, key, %{read: -1, write: -1})
 
@@ -443,8 +500,9 @@ defmodule Anoma.Node.Transaction.Shard do
     end
   end
 
-  @impl true
-  def handle_info({:read_watermark_advanced, key, h_read}, state) do
+  @spec handle_read_watermark_advanced(key(), height(), __MODULE__.t()) ::
+          {:noreply, __MODULE__.t()}
+  defp handle_read_watermark_advanced(key, h_read, state) do
     current_key_watermarks =
       Map.get(state.watermarks, key, %{read: -1, write: -1})
 
@@ -466,9 +524,9 @@ defmodule Anoma.Node.Transaction.Shard do
     end
   end
 
-  # --- Unreserve Handling ---
-  @impl true
-  def handle_cast({:unreserve, height}, state) do
+  @spec handle_unreserve(height(), __MODULE__.t()) ::
+          {:noreply, __MODULE__.t()}
+  defp handle_unreserve(height, state) do
     # Iterate through all keys in the KV store, accumulating the state
     final_state =
       Enum.reduce(state.kv, state, fn {key, key_height_map}, acc_state ->
@@ -667,12 +725,10 @@ defmodule Anoma.Node.Transaction.Shard do
 
         # 3. Determine essential heights to keep below each active read reservation
         essential_below_reservations =
-          Enum.reduce(read_reservation_heights, MapSet.new(), fn h_rr,
-                                                                 acc_set ->
-            MapSet.union(
-              acc_set,
-              find_essential_heights_below(h_rr, key_height_map)
-            )
+          read_reservation_heights
+          |> Enum.map(&find_essential_heights_below(&1, key_height_map))
+          |> Enum.reduce(MapSet.new(), fn set1, set2 ->
+            MapSet.union(set1, set2)
           end)
 
         # 4. Combine all heights that MUST be kept:

@@ -394,18 +394,12 @@ defmodule Anoma.Node.Transaction.Backends do
   # Helper for parsing reservation lists recursively
   @spec do_parse_reservations(Noun.t(), [{:read | :write, binary()}]) ::
           {:ok, [{:read | :write, binary()}]} | {:error, atom()}
+  defp do_parse_reservations(noun, acc) when Noun.is_noun_zero(noun) do
+    {:ok, acc}
+  end
+
   defp do_parse_reservations(noun, acc) do
     case noun do
-      # --- Standard list terminators ---
-      0 ->
-        {:ok, Enum.reverse(acc)}
-
-      [] ->
-        {:ok, Enum.reverse(acc)}
-
-      <<>> ->
-        {:ok, Enum.reverse(acc)}
-
       # --- Recursive case: [ [type | key] | rest ] ---
       [[type_num | key_noun] = head | rest] ->
         case process_reservation_pair(type_num, key_noun) do
@@ -564,18 +558,12 @@ defmodule Anoma.Node.Transaction.Backends do
 
   @spec do_parse_writes(Noun.t(), [{Noun.t(), Noun.t()}]) ::
           {:ok, [{Noun.t(), Noun.t()}]} | {:error, atom}
+  defp do_parse_writes(noun, acc) when Noun.is_noun_zero(noun) do
+    {:ok, acc}
+  end
+
   defp do_parse_writes(noun, acc) do
     case noun do
-      # Base cases: Common list terminators
-      0 ->
-        {:ok, Enum.reverse(acc)}
-
-      [] ->
-        {:ok, Enum.reverse(acc)}
-
-      <<>> ->
-        {:ok, Enum.reverse(acc)}
-
       # Recursive case: [ [key | value] | rest ]
       [[key_noun | value_noun] = head | rest] ->
         if Noun.is_noun_atom(key_noun) and not is_list(value_noun) do

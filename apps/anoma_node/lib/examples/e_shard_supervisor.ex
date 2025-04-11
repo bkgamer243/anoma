@@ -27,11 +27,7 @@ defmodule Anoma.Node.Examples.EShardSupervisor do
     enode = ENode.start_node(opts)
     assert %ENode{node_id: ^node_id} = enode
 
-    # Allow supervisors a moment to start children
-    Process.sleep(100)
-
     # 2. Verify ShardRouter Exists
-    via_router = Registry.via(node_id, ShardRouter)
     pid_router = Registry.whereis(node_id, ShardRouter)
 
     assert is_pid(pid_router),
@@ -56,19 +52,19 @@ defmodule Anoma.Node.Examples.EShardSupervisor do
     assert state_c.kv["c"][-1].value == 7, "Shard 'c' initial value mismatch"
 
     # 5. Query ShardRouter using the specific router's via tuple
-    assert GenServer.call(via_router, {:get_shard_label, "a"}) ==
+    assert ShardRouter.get_shard_label(node_id, "a") ==
              {:ok, :a},
            "Router lookup for 'a' failed"
 
-    assert GenServer.call(via_router, {:get_shard_label, "b"}) ==
+    assert ShardRouter.get_shard_label(node_id, "b") ==
              {:ok, :b},
            "Router lookup for 'b' failed"
 
-    assert GenServer.call(via_router, {:get_shard_label, "c"}) ==
+    assert ShardRouter.get_shard_label(node_id, "c") ==
              {:ok, :c},
            "Router lookup for 'c' failed"
 
-    assert GenServer.call(via_router, {:get_shard_label, "d"}) == :error,
+    assert ShardRouter.get_shard_label(node_id, "d") == :error,
            "Router lookup for unknown key 'd' should return :error"
 
     # 6. Cleanup

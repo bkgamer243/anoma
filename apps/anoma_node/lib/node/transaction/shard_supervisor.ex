@@ -71,12 +71,6 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
         ]
 
   ############################################################
-  #                       Constants                          #
-  ############################################################
-
-  @ets_table_name :shard_key_map
-
-  ############################################################
   #                 Supervisor Implementation                #
   ############################################################
 
@@ -108,84 +102,128 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
     node_id = Keyword.fetch!(args, :node_id)
     Process.set_label({__MODULE__, node_id})
 
-    # Process schema only if strategy and schema are validly provided
-    {shard_child_specs, key_to_id_map} =
-      case {Keyword.get(args, :strategy), Keyword.get(args, :schema)} do
-        {:one_per_key, schema} when is_list(schema) ->
-          # Iterate schema once to build specs and key->id map
-          Enum.reduce(schema, {[], %{}}, fn schema_entry,
-                                            {specs_acc, map_acc} ->
-            case schema_entry do
-              # Case 1: Schema entry is {key, initial_value}
-              {key, initial_value} when is_binary(key) ->
-                shard_id = String.to_atom(key)
+    try do
+      # Process schema only if strategy and schema are validly provided
+      {shard_child_specs, key_to_id_map} =
+        process_schema(
+          node_id,
+          Keyword.get(args, :strategy),
+          Keyword.get(args, :schema)
+        )
 
-                shard_args = [
-                  node_id: node_id,
-                  id: shard_id,
-                  initial_kv: %{key => initial_value}
-                ]
+      # Create ETS table if shards were generated
+      case create_and_populate_ets_table(key_to_id_map) do
+        {:ok, ets_tid} ->
+          # Define router child spec, passing the ETS table ID
+          router_child_spec = {ShardRouter, [node_id: node_id, tid: ets_tid]}
+          all_children = [router_child_spec | shard_child_specs]
 
-                child_spec = %{
-                  id: shard_id,
-                  start: {Shard, :start_link, [shard_args]}
-                }
+          Supervisor.init(all_children, strategy: :one_for_one)
 
-                {[child_spec | specs_acc], Map.put(map_acc, key, shard_id)}
+        :no_shards ->
+          # No shards configured or generated, start no children
+          Supervisor.init([], strategy: :one_for_one)
 
-              # Case 2: Schema entry is just a key
-              key when is_binary(key) ->
-                shard_id = String.to_atom(key)
-                shard_args = [node_id: node_id, id: shard_id, initial_kv: %{}]
-
-                child_spec = %{
-                  id: shard_id,
-                  start: {Shard, :start_link, [shard_args]}
-                }
-
-                {[child_spec | specs_acc], Map.put(map_acc, key, shard_id)}
-
-              _invalid_entry ->
-                # Skip invalid entry
-                {specs_acc, map_acc}
-            end
-          end)
-
-        {nil, _} ->
-          {[], %{}}
-
-        {_strategy, nil} ->
-          {[], %{}}
-
-        {_invalid_strategy, _} ->
-          {[], %{}}
+        {:error, _reason} ->
+          {:stop, :ets_table_creation_failed}
       end
+    rescue
+      e ->
+        # Reraise the exception to ensure supervisor termination/restart according to strategy
+        reraise e, __STACKTRACE__
+    end
+  end
 
-    # Create and populate ETS table (mapping key -> shard_id) if shards were generated
-    if map_size(key_to_id_map) > 0 do
-      ets_table =
-        :ets.new(@ets_table_name, [
+  ############################################################
+  #                    Private Helpers                       #
+  ############################################################
+
+  # Processes the schema based on the strategy to generate shard child specs
+  # and a map of key -> shard_id.
+  @spec process_schema(
+          node_id :: String.t(),
+          strategy :: strategy_t() | nil,
+          schema :: schema_t() | nil
+        ) ::
+          {
+            [Supervisor.child_spec()],
+            %{key_t() => atom()}
+          }
+  defp process_schema(node_id, :one_per_key, schema) when is_list(schema) do
+    Enum.reduce(schema, {[], %{}}, fn schema_entry, {specs_acc, map_acc} ->
+      case schema_entry do
+        # Case 1: Schema entry is {key, initial_value}
+        {key, initial_value} when is_binary(key) ->
+          shard_id = String.to_atom(key)
+
+          shard_args = [
+            node_id: node_id,
+            id: shard_id,
+            initial_kv: %{key => initial_value}
+          ]
+
+          child_spec = %{
+            id: shard_id,
+            start: {Shard, :start_link, [shard_args]}
+          }
+
+          {[child_spec | specs_acc], Map.put(map_acc, key, shard_id)}
+
+        # Case 2: Schema entry is just a key
+        key when is_binary(key) ->
+          shard_id = String.to_atom(key)
+
+          shard_args = [
+            node_id: node_id,
+            id: shard_id,
+            initial_kv: %{}
+          ]
+
+          child_spec = %{
+            id: shard_id,
+            start: {Shard, :start_link, [shard_args]}
+          }
+
+          {[child_spec | specs_acc], Map.put(map_acc, key, shard_id)}
+
+        _invalid_entry ->
+          # Skip invalid entry
+          {specs_acc, map_acc}
+      end
+    end)
+  end
+
+  # Cases where strategy/schema are nil or invalid
+  defp process_schema(_node_id, _strategy, _schema) do
+    {[], %{}}
+  end
+
+  # Creates a new ETS table and populates it with the key -> shard_id mapping.
+  # Returns {:ok, tid} on success, :no_shards if the map is empty, or {:error, reason}.
+  @spec create_and_populate_ets_table(map :: %{key_t() => atom()}) ::
+          {:ok, :ets.tab()} | :no_shards | {:error, any()}
+  defp create_and_populate_ets_table(key_to_id_map)
+       when map_size(key_to_id_map) > 0 do
+    try do
+      ets_tid =
+        :ets.new(:_, [
           :set,
-          :public,
-          :named_table,
-          read_concurrency: true
+          :public
         ])
 
-      # Verify table creation/access and log insertions
-      if :ets.info(ets_table, :name) == @ets_table_name do
-        for {key, shard_id} <- key_to_id_map do
-          :ets.insert(ets_table, {key, shard_id})
-        end
-      end
+      Enum.each(key_to_id_map, fn {key, shard_id} ->
+        :ets.insert(ets_tid, {key, shard_id})
+      end)
 
-      # Define router child spec (only needed if shards exist)
-      router_child_spec = {ShardRouter, [node_id: node_id]}
-      all_children = [router_child_spec | shard_child_specs]
-
-      Supervisor.init(all_children, strategy: :one_for_one)
-    else
-      # No shards configured or generated, start no children
-      Supervisor.init([], strategy: :one_for_one)
+      {:ok, ets_tid}
+    catch
+      kind, reason ->
+        stack = __STACKTRACE__
+        {:error, {kind, reason, stack}}
     end
+  end
+
+  defp create_and_populate_ets_table(_empty_map) do
+    :no_shards
   end
 end

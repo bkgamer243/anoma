@@ -3,11 +3,12 @@ defmodule Anoma.Node.Examples.EShardBackend do
   I contain examples demonstrating transaction execution using the Shard backend.
   """
 
-  alias Anoma.Node.Transaction.Backends
   alias Anoma.Node.Examples.ENode
+  alias Examples.ENock
   alias Anoma.Node.Transaction.Mempool
   alias Anoma.Node.Transaction.Shard
   alias Anoma.Node.Registry
+  alias Anoma.Node.Event
 
   require Noun
   require Logger
@@ -17,118 +18,50 @@ defmodule Anoma.Node.Examples.EShardBackend do
 
   @dialyzer :no_improper_lists
 
-  @doc """
-  I test a Nock program for writing 3 to "a".
+  # --- Helper Functions ---
 
-  I verify stage 1 (reservation/code split) and stage 2 (execution).
-  """
-  @spec test_nock_program_tx1() :: :ok
-  def test_nock_program_tx1() do
-    # Setup
-    key_a_int = Noun.atom_binary_to_integer("a")
-    dummy_tx_id = "test_tx_id_1"
+  # Helper to wait for BlockEvent
+  defp wait_for_block(node_id, expected_round) do
+    block_filter = [
+      Event.node_filter(node_id),
+      %Mempool.BlockFilter{}
+    ]
 
-    # Tx1 reservations: Write to "a"
-    tx1_reservations = [1 | key_a_int]
+    EventBroker.subscribe_me(block_filter)
 
-    # Create a "stage 2" program that just returns a fixed key-value pair
-    tx1_writes = [key_a_int | 3]
+    assert_receive(
+      %EventBroker.Event{
+        body: %Event{
+          node_id: ^node_id,
+          body: %Mempool.BlockEvent{round: ^expected_round}
+        }
+      },
+      # Timeout after 5 seconds
+      5000
+    )
 
-    # Program that basically just acts as constant functions for reservations and writes
-    tx1_code = [[0 | 3] | [tx1_reservations | [[1 | tx1_writes] | [0 | 0]]]]
-
-    # Stage 1: Execute the core using the backend's formula to extract reservations
-    {:ok, stage1_result} = Nock.nock(tx1_code, [9, 2, 0 | 1], %Nock{})
-
-    # Extract components from stage 1 result
-    [res1 | tx1_stage2_code] = stage1_result
-    assert res1 == tx1_reservations
-
-    # Check that reservations parse properly
-    {:ok, parsed_reservations} = Backends.parse_reservations(res1)
-    assert parsed_reservations == [{:write, "a"}]
-
-    # Stage 2: Execute using the exact sequence from Backends.vm_execute_stage2
-    env_tx1 = %Nock{}
-
-    # Step 1: Apply formula [10, [6, 1 | id], 0 | 1] - this inserts the tx_id into the code
-    {:ok, ordered_tx1} =
-      Nock.nock(tx1_stage2_code, [10, [6, 1 | dummy_tx_id], 0 | 1], env_tx1)
-
-    # Step 2: Apply formula [9, 2, 0 | 1] - this executes the transaction
-    {:ok, result1} = Nock.nock(ordered_tx1, [9, 2, 0 | 1], env_tx1)
-
-    # This is the expected format that backends.ex receives from vm_execute_stage2
-    assert result1 == tx1_writes
-
+    EventBroker.unsubscribe_me(block_filter)
     :ok
   end
 
-  @doc """
-  I test a Nock program for the sequence (read a, read b, add a and b, write result to c).
+  # Helper function to log shard states
+  defp log_shard_states(node_id, stage_name) do
+    pid_a = Registry.whereis(node_id, Shard, :a)
+    pid_b = Registry.whereis(node_id, Shard, :b)
+    pid_c = Registry.whereis(node_id, Shard, :c)
 
-  I verify stage 1 (reservation/code split) and stage 2 (execution with mock scry).
-  """
-  @spec test_nock_program_tx3() :: :ok
-  def test_nock_program_tx3() do
-    # Setup
-    key_a_int = Noun.atom_binary_to_integer("a")
-    key_b_int = Noun.atom_binary_to_integer("b")
-    key_c_int = Noun.atom_binary_to_integer("c")
-    dummy_tx_id = "test_tx_id_3"
+    state_a = if is_pid(pid_a), do: :sys.get_state(pid_a), else: :not_found
+    state_b = if is_pid(pid_b), do: :sys.get_state(pid_b), else: :not_found
+    state_c = if is_pid(pid_c), do: :sys.get_state(pid_c), else: :not_found
 
-    # Tx3: Read "a", Read "b", Add, Write result to "c"
-    tx3_reservations = [
-      [0 | key_a_int],
-      [0 | key_b_int]
-      | [1 | key_c_int]
-    ]
-
-    tx3_writes = [key_c_int | 7]
-
-    scryA = [12 | [[1 | 0] | [1 | key_a_int]]]
-    scryB = [12 | [[1 | 0] | [1 | key_b_int]]]
-    addFormula = [4 | [4 | [4 | [4 | [0 | 2]]]]]
-    sumFormula = [7 | [[scryA | scryB] | addFormula]]
-
-    tx3_code = [
-      [0 | 3]
-      | [tx3_reservations | [[[1 | key_c_int] | sumFormula] | [0 | 0]]]
-    ]
-
-    # Stage 1: Execute the core using the backend's formula
-    {:ok, [res3 | tx3_stage2_code]} =
-      Nock.nock(tx3_code, [9, 2, 0 | 1], %Nock{})
-
-    # Extract the components
-    assert res3 == tx3_reservations
-
-    # Check that reservations parse properly
-    {:ok, parsed_reservations} = Backends.parse_reservations(res3)
-    assert parsed_reservations == [{:read, "a"}, {:read, "b"}, {:write, "c"}]
-
-    # Create a mock scry function that simulates reading values from storage
-    mock_scry_tx3 = fn
-      ^key_a_int -> {:ok, 3}
-      ^key_b_int -> {:ok, 4}
-      _ -> :error
-    end
-
-    env_tx3 = %Nock{scry_function: mock_scry_tx3}
-
-    # Stage 2: Execute using the exact sequence from Backends.vm_execute_stage2
-    # Step 1: Apply formula [10, [6, 1 | id], 0 | 1] - inserts tx_id
-    {:ok, ordered_tx3} =
-      Nock.nock(tx3_stage2_code, [10, [6, 1 | dummy_tx_id], 0 | 1], env_tx3)
-
-    # Step 2: Apply formula [9, 2, 0 | 1] - executes transaction
-    {:ok, result3} = Nock.nock(ordered_tx3, [9, 2, 0 | 1], env_tx3)
-
-    # Expected sum and result format
-    assert result3 == tx3_writes
-
-    :ok
+    Logger.debug("-- Shard States [#{stage_name}] --")
+    Logger.debug("Shard A state: #{inspect(state_a)}")
+    Logger.debug("Shard B state: #{inspect(state_b)}")
+    Logger.debug("Shard C state: #{inspect(state_c)}")
+    Logger.debug("-------------------------------")
   end
+
+  # --- Test Functions ---
 
   @doc """
   I test the integration of transactions with the shard backend.
@@ -149,42 +82,11 @@ defmodule Anoma.Node.Examples.EShardBackend do
     opts = [node_id: node_id, transaction: [shards: shard_config]]
     enode = ENode.start_node(opts)
     assert %ENode{node_id: ^node_id} = enode
-    # Allow time for supervisors and shards to start
-    Process.sleep(200)
 
-    # 2. Define Keys and Transaction Code
-    key_a_int = Noun.atom_binary_to_integer("a")
-    key_b_int = Noun.atom_binary_to_integer("b")
-    key_c_int = Noun.atom_binary_to_integer("c")
-
-    # Tx1: Write 3 to "a" (Adapting from test_nock_program_tx1)
-    tx1_reservations = [1 | key_a_int]
-    tx1_writes = [key_a_int | 3]
-
-    # Code structure: [ [0|3] | [ <reservations> | [ <writes_logic> | [0|0] ] ] ]
-    # Writes logic for constant: [1 | <write_pair>]
-    tx1_code = [[0 | 3] | [tx1_reservations | [[1 | tx1_writes] | [0 | 0]]]]
-
-    # Tx2: Write 4 to "b"
-    tx2_reservations = [1 | key_b_int]
-    tx2_writes = [key_b_int | 4]
-    tx2_code = [[0 | 3] | [tx2_reservations | [[1 | tx2_writes] | [0 | 0]]]]
-
-    # Tx3: Read "a", Read "b", Add, Write result to "c" (Adapting from test_nock_program_tx3)
-    # Reservations: read "a", read "b", write "c"
-    tx3_reservations = [[0 | key_a_int], [0 | key_b_int] | [1 | key_c_int]]
-
-    # Scry structure: [12 | [subject | formula]] where subject=[1|0], formula=[1|key]
-    scryA = [12 | [[1 | 0] | [1 | key_a_int]]]
-    scryB = [12 | [[1 | 0] | [1 | key_b_int]]]
-
-    # Add opcode (4) applied repeatedly to pin the scry results [scryA scryB] from the subject (0 2)
-    addFormula = [4 | [4 | [4 | [4 | [0 | 2]]]]]
-    # Formula to calculate sum: apply addFormula to [scryA scryB]
-    sumFormula = [7 | [[scryA | scryB] | addFormula]]
-    # Writes logic for calculated value: [ [1 | key_c_int] | <sum_formula> ]
-    tx3_writes_logic = [[1 | key_c_int] | sumFormula]
-    tx3_code = [[0 | 3] | [tx3_reservations | [tx3_writes_logic | [0 | 0]]]]
+    # Use pre-defined Nock programs from Examples.ENock
+    tx1_code = ENock.write_code_gen(ENock.a_int(), 3)
+    tx2_code = ENock.write_code_gen(ENock.b_int(), 4)
+    tx3_code = ENock.read_ab_write_c_sum()
 
     # 3. Submit Transactions
     :ok = Mempool.tx(node_id, {:shard_storage, tx1_code}, "tx1")
@@ -200,8 +102,7 @@ defmodule Anoma.Node.Examples.EShardBackend do
     # Execute Tx1
     Logger.info("Executing Tx1...")
     :ok = Mempool.execute(node_id, ["tx1"])
-    # Allow time for completion
-    Process.sleep(500)
+    :ok = wait_for_block(node_id, 1)
     Logger.info("Finished executing Tx1.")
     log_shard_states(node_id, "After Tx1")
 
@@ -214,8 +115,7 @@ defmodule Anoma.Node.Examples.EShardBackend do
     # Execute Tx2
     Logger.info("Executing Tx2...")
     :ok = Mempool.execute(node_id, ["tx2"])
-    # Allow time for completion
-    Process.sleep(500)
+    :ok = wait_for_block(node_id, 2)
     Logger.info("Finished executing Tx2.")
     log_shard_states(node_id, "After Tx2")
 
@@ -228,8 +128,7 @@ defmodule Anoma.Node.Examples.EShardBackend do
     # Execute Tx3
     Logger.info("Executing Tx3...")
     :ok = Mempool.execute(node_id, ["tx3"])
-    # Allow time for read/write/complete
-    Process.sleep(500)
+    :ok = wait_for_block(node_id, 3)
     Logger.info("Finished executing Tx3.")
     log_shard_states(node_id, "After Tx3 (Final)")
 
@@ -299,32 +198,11 @@ defmodule Anoma.Node.Examples.EShardBackend do
     opts = [node_id: node_id, transaction: [shards: shard_config]]
     enode = ENode.start_node(opts)
     assert %ENode{node_id: ^node_id} = enode
-    # Allow time for supervisors and shards to start
-    Process.sleep(200)
 
-    # 2. Define Keys and Transaction Code (same as sequential test)
-    key_a_int = Noun.atom_binary_to_integer("a")
-    key_b_int = Noun.atom_binary_to_integer("b")
-    key_c_int = Noun.atom_binary_to_integer("c")
-
-    # Tx1: Write 3 to "a"
-    tx1_reservations = [1 | key_a_int]
-    tx1_writes = [key_a_int | 3]
-    tx1_code = [[0 | 3] | [tx1_reservations | [[1 | tx1_writes] | [0 | 0]]]]
-
-    # Tx2: Write 4 to "b"
-    tx2_reservations = [1 | key_b_int]
-    tx2_writes = [key_b_int | 4]
-    tx2_code = [[0 | 3] | [tx2_reservations | [[1 | tx2_writes] | [0 | 0]]]]
-
-    # Tx3: Read "a", Read "b", Add, Write result to "c"
-    tx3_reservations = [[0 | key_a_int], [0 | key_b_int] | [1 | key_c_int]]
-    scryA = [12 | [[1 | 0] | [1 | key_a_int]]]
-    scryB = [12 | [[1 | 0] | [1 | key_b_int]]]
-    addFormula = [4 | [4 | [4 | [4 | [0 | 2]]]]]
-    sumFormula = [7 | [[scryA | scryB] | addFormula]]
-    tx3_writes_logic = [[1 | key_c_int] | sumFormula]
-    tx3_code = [[0 | 3] | [tx3_reservations | [tx3_writes_logic | [0 | 0]]]]
+    # Use pre-defined Nock programs from Examples.ENock
+    tx1_code = ENock.write_code_gen(ENock.a_int(), 3)
+    tx2_code = ENock.write_code_gen(ENock.b_int(), 4)
+    tx3_code = ENock.read_ab_write_c_sum()
 
     # 3. Submit All Transactions
     :ok = Mempool.tx(node_id, {:shard_storage, tx1_code}, "tx1")
@@ -339,9 +217,7 @@ defmodule Anoma.Node.Examples.EShardBackend do
     # 4. Execute All Transactions Together
     Logger.info("Executing Tx1, Tx2, Tx3 concurrently...")
     :ok = Mempool.execute(node_id, ordered_tx_ids)
-    # Allow time for completion
-    # Increased sleep slightly for concurrent execution
-    Process.sleep(1000)
+    :ok = wait_for_block(node_id, 1)
     Logger.info("Finished executing Tx1, Tx2, Tx3.")
     log_shard_states(node_id, "After Concurrent Execution")
 
@@ -404,36 +280,18 @@ defmodule Anoma.Node.Examples.EShardBackend do
     opts = [node_id: node_id, transaction: [shards: shard_config]]
     enode = ENode.start_node(opts)
     assert %ENode{node_id: ^node_id} = enode
-    # Allow supervisors/shards to start
-    Process.sleep(200)
 
     pid_a = Registry.whereis(node_id, Shard, :a)
     pid_b = Registry.whereis(node_id, Shard, :b)
     assert is_pid(pid_a), "Shard 'a' PID not found."
     assert is_pid(pid_b), "Shard 'b' PID not found."
 
-    key_a_int = Noun.atom_binary_to_integer("a")
-    key_b_int = Noun.atom_binary_to_integer("b")
+    # Use pre-defined Nock programs from Examples.ENock
+    write_1_code = ENock.write_code_gen(ENock.a_int(), 1)
+    write_2_code = ENock.write_code_gen(ENock.a_int(), 2)
+    write_3_code = ENock.write_code_gen(ENock.a_int(), 3)
+    copy_code = ENock.copy_a_to_b()
 
-    # --- Define Nock Programs ---
-
-    # Write Program Generator (writes a constant value to key 'a')
-    write_1_code = write_code_gen(key_a_int, 1)
-    write_2_code = write_code_gen(key_a_int, 2)
-    write_3_code = write_code_gen(key_a_int, 3)
-
-    # Copy Program (reads from 'a', writes to 'b')
-    copy_reservations = [[0 | key_a_int] | [1 | key_b_int]]
-    # Read from 'a'
-    scryA = [12 | [[1 | 0] | [1 | key_a_int]]]
-    # Write scry result to 'b'
-    copy_writes_logic = [[1 | key_b_int] | scryA]
-
-    copy_code = [
-      [0 | 3] | [copy_reservations | [copy_writes_logic | [0 | 0]]]
-    ]
-
-    # --- Transaction Execution Sequence ---
     # Helper for execution and verification
     exec_and_verify = fn height, code, tx_base_id, checks ->
       tx_id = "#{tx_base_id}_#{height}"
@@ -441,8 +299,7 @@ defmodule Anoma.Node.Examples.EShardBackend do
       Logger.info("Executing Tx #{height} (#{tx_id})...")
       :ok = Mempool.tx(node_id, {:shard_storage, code}, tx_id)
       :ok = Mempool.execute(node_id, [tx_id])
-      # Allow time for completion
-      Process.sleep(500)
+      :ok = wait_for_block(node_id, height)
       Logger.info("Finished executing Tx #{height}.")
 
       state_a = :sys.get_state(pid_a)
@@ -622,42 +479,23 @@ defmodule Anoma.Node.Examples.EShardBackend do
     opts = [node_id: node_id, transaction: [shards: shard_config]]
     enode = ENode.start_node(opts)
     assert %ENode{node_id: ^node_id} = enode
-    # Allow supervisors/shards to start
-    Process.sleep(200)
 
     pid_a = Registry.whereis(node_id, Shard, :a)
     pid_b = Registry.whereis(node_id, Shard, :b)
     assert is_pid(pid_a), "Shard 'a' PID not found."
     assert is_pid(pid_b), "Shard 'b' PID not found."
 
-    key_a_int = Noun.atom_binary_to_integer("a")
-    key_b_int = Noun.atom_binary_to_integer("b")
-
-    # --- Define Nock Programs ---
-    # Tx 1: Write 1 to 'a'
-    write_1_code = write_code_gen(key_a_int, 1)
-
-    # Tx 2: Reserve write on 'a', then crash (using [0 | [0 | 0]] which is invalid for writes stage)
-    crash_reservations = [1 | key_a_int]
-    crash_code = [[0 | 3] | [crash_reservations | [0 | [0 | 0]]]]
-
-    # Tx 3: Copy 'a' to 'b'
-    copy_reservations = [[0 | key_a_int] | [1 | key_b_int]]
-    scryA = [12 | [[1 | 0] | [1 | key_a_int]]]
-    copy_writes_logic = [[1 | key_b_int] | scryA]
-
-    copy_code = [
-      [0 | 3] | [copy_reservations | [copy_writes_logic | [0 | 0]]]
-    ]
-
-    # --- Transaction Execution ---
+    # Use pre-defined Nock programs from Examples.ENock
+    tx1_code = ENock.write_code_gen(ENock.a_int(), 1)
+    tx2_code = ENock.crash_after_reserve_a()
+    tx3_code = ENock.copy_a_to_b()
 
     # Execute Tx 1 (Write 1 to a, h=1)
     tx1_id = "write_1_1"
     Logger.info("Executing Tx 1 (#{tx1_id})...")
-    :ok = Mempool.tx(node_id, {:shard_storage, write_1_code}, tx1_id)
+    :ok = Mempool.tx(node_id, {:shard_storage, tx1_code}, tx1_id)
     :ok = Mempool.execute(node_id, [tx1_id])
-    Process.sleep(500)
+    :ok = wait_for_block(node_id, 1)
     log_shard_states(node_id, "After Tx 1")
     state_a_1 = :sys.get_state(pid_a)
     assert state_a_1.kv["a"][1].value == 1
@@ -666,13 +504,13 @@ defmodule Anoma.Node.Examples.EShardBackend do
     # Execute Tx 2 (Crash on a, h=2)
     tx2_id = "crash_1_2"
     Logger.info("Executing Tx 2 (#{tx2_id})...")
-    :ok = Mempool.tx(node_id, {:shard_storage, crash_code}, tx2_id)
+    :ok = Mempool.tx(node_id, {:shard_storage, tx2_code}, tx2_id)
     # Capture the expected error log for the crashing transaction
     log_output =
       capture_log(fn ->
         :ok = Mempool.execute(node_id, [tx2_id])
-        # Allow time for execution and logging
-        Process.sleep(500)
+        # Wait even though it crashed, block should still commit
+        :ok = wait_for_block(node_id, 2)
       end)
 
     assert log_output =~
@@ -688,9 +526,9 @@ defmodule Anoma.Node.Examples.EShardBackend do
     # Execute Tx 3 (Copy a to b, h=3)
     tx3_id = "copy_1_3"
     Logger.info("Executing Tx 3 (#{tx3_id})...")
-    :ok = Mempool.tx(node_id, {:shard_storage, copy_code}, tx3_id)
+    :ok = Mempool.tx(node_id, {:shard_storage, tx3_code}, tx3_id)
     :ok = Mempool.execute(node_id, [tx3_id])
-    Process.sleep(500)
+    :ok = wait_for_block(node_id, 3)
     log_shard_states(node_id, "After Tx 3")
     state_a_3 = :sys.get_state(pid_a)
     state_b_3 = :sys.get_state(pid_b)
@@ -708,31 +546,5 @@ defmodule Anoma.Node.Examples.EShardBackend do
     # --- Cleanup ---
     :ok = ENode.stop_node(enode)
     :ok
-  end
-
-  # --- Helper Functions ---
-
-  # Write Program Generator (writes a constant value to a key)
-  defp write_code_gen(key_int, value) do
-    reservations = [1 | key_int]
-    writes_logic = [1 | [key_int | value]]
-    [[0 | 3] | [reservations | [writes_logic | [0 | 0]]]]
-  end
-
-  # Helper function to log shard states
-  defp log_shard_states(node_id, stage_name) do
-    pid_a = Registry.whereis(node_id, Shard, :a)
-    pid_b = Registry.whereis(node_id, Shard, :b)
-    pid_c = Registry.whereis(node_id, Shard, :c)
-
-    state_a = if is_pid(pid_a), do: :sys.get_state(pid_a), else: :not_found
-    state_b = if is_pid(pid_b), do: :sys.get_state(pid_b), else: :not_found
-    state_c = if is_pid(pid_c), do: :sys.get_state(pid_c), else: :not_found
-
-    Logger.debug("-- Shard States [#{stage_name}] --")
-    Logger.debug("Shard A state: #{inspect(state_a)}")
-    Logger.debug("Shard B state: #{inspect(state_b)}")
-    Logger.debug("Shard C state: #{inspect(state_c)}")
-    Logger.debug("-------------------------------")
   end
 end

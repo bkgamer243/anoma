@@ -12,7 +12,7 @@ defmodule Anoma.Node.Examples.EShard do
   I start a Shard with a predefined initial state and verify that
   reading the initial state (at height 0) returns the correct values.
   """
-  @spec start_and_test_initial_state() :: :ok
+  @spec start_and_test_initial_state() :: Shard.t()
   def start_and_test_initial_state() do
     node_id = "test_shard_1_node"
     shard_id = :test_shard_1
@@ -52,14 +52,14 @@ defmodule Anoma.Node.Examples.EShard do
     # Test key "c"
     assert Shard.read(shard_via, "c", 4) == {:ok, 15}
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
   I test a scenario where a read is requested before the watermark allows,
   then the watermark advances, and the read completes.
   """
-  @spec test_queued_read() :: :ok
+  @spec test_queued_read() :: Shard.t()
   def test_queued_read() do
     node_id = "test_shard_queued_node"
     shard_id = :test_shard_queued
@@ -85,9 +85,6 @@ defmodule Anoma.Node.Examples.EShard do
         Shard.read(shard_via, key, height)
       end)
 
-    # Give the task a tiny moment to start and make the call
-    Process.sleep(50)
-
     # 3. Advance the watermark *after* the read call is blocked
     send(shard_pid, {:write_watermark_advanced, key, height + 1})
 
@@ -97,7 +94,7 @@ defmodule Anoma.Node.Examples.EShard do
     # 5. Assert the result
     assert result == {:ok, 5}
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
@@ -105,7 +102,7 @@ defmodule Anoma.Node.Examples.EShard do
   a write is performed *after* the read is queued but *before* the read resolves,
   affecting the read's outcome.
   """
-  @spec test_queued_read_with_intermediate_write() :: :ok
+  @spec test_queued_read_with_intermediate_write() :: Shard.t()
   def test_queued_read_with_intermediate_write() do
     node_id = "test_shard_queued_write_node"
     shard_id = :test_shard_queued_write
@@ -136,9 +133,6 @@ defmodule Anoma.Node.Examples.EShard do
         Shard.read(shard_via, key, read_height)
       end)
 
-    # Give the task a moment to start and block on the read call
-    Process.sleep(50)
-
     # 3. Acquire Write Reservation for an intermediate height BEFORE watermark advances
     assert :ok == Shard.reserve(shard_via, key, write_height, :write)
 
@@ -166,21 +160,21 @@ defmodule Anoma.Node.Examples.EShard do
     # Therefore, the latest write < 7 is the one at height 5.
     assert result == {:ok, write_value}
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
   I test a scenario where a read is requested, but the watermark never
   advances, causing the read to time out.
   """
-  @spec test_read_timeout() :: :ok | nil
+  @spec test_read_timeout() :: Shard.t()
   def test_read_timeout() do
     node_id = "test_shard_timeout_node"
     shard_id = :test_shard_timeout
     shard_via = Registry.via(node_id, Shard, shard_id)
 
     # Start the shard (initial state doesn't matter)
-    {:ok, _shard_pid} =
+    {:ok, shard_pid} =
       Shard.start_link(node_id: node_id, id: shard_id, initial_kv: %{})
 
     key = "a"
@@ -213,6 +207,8 @@ defmodule Anoma.Node.Examples.EShard do
 
     if Process.alive?(read_task.pid),
       do: Task.shutdown(read_task, :brutal_kill)
+
+    :sys.get_state(shard_pid)
   end
 
   @doc """
@@ -220,7 +216,7 @@ defmodule Anoma.Node.Examples.EShard do
   An intermediate watermark advance unblocks only the lower-height read,
   while the higher-height read eventually times out.
   """
-  @spec test_partial_read_unblocking_with_timeout() :: :ok | nil
+  @spec test_partial_read_unblocking_with_timeout() :: Shard.t()
   def test_partial_read_unblocking_with_timeout() do
     node_id = "test_shard_partial_unblock_node"
     shard_id = :test_shard_partial_unblock
@@ -256,9 +252,6 @@ defmodule Anoma.Node.Examples.EShard do
         Shard.read(shard_via, key, read_height_timeout)
       end)
 
-    # Give tasks time to start and block
-    Process.sleep(50)
-
     # 3. Advance Watermark partially (enough for height 5, not for 15)
     send(shard_pid, {:write_watermark_advanced, key, watermark_height})
 
@@ -281,13 +274,15 @@ defmodule Anoma.Node.Examples.EShard do
 
     if Process.alive?(read_task_timeout.pid),
       do: Task.shutdown(read_task_timeout, :brutal_kill)
+
+    :sys.get_state(shard_pid)
   end
 
   @doc """
   I test a more complex scenario involving multiple writes, reads, and
   write watermark advancements.
   """
-  @spec test_complex_write_and_read_scenario() :: :ok
+  @spec test_complex_write_and_read_scenario() :: Shard.t()
   def test_complex_write_and_read_scenario() do
     node_id = "test_shard_complex_writes_node"
     shard_id = :test_shard_complex_writes
@@ -356,14 +351,14 @@ defmodule Anoma.Node.Examples.EShard do
     # Sees write@10
     assert Shard.read(shard_via, key, 11) == {:ok, 8}
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
   I test the internal state changes related to Garbage Collection (GC)
   and the state of entries after reservations are released.
   """
-  @spec test_gc_and_reserve_release_state() :: :ok
+  @spec test_gc_and_reserve_release_state() :: Shard.t()
   def test_gc_and_reserve_release_state() do
     node_id = "test_shard_gc_reserve_release_node"
     shard_id = :test_shard_gc_reserve_release
@@ -419,8 +414,6 @@ defmodule Anoma.Node.Examples.EShard do
 
     # --- Advance Read Watermark (GC Trigger) ---
     send(shard_pid, {:read_watermark_advanced, key, 33})
-    # Allow time for message processing
-    Process.sleep(50)
 
     # --- Direct State Check (Post-GC) ---
     state3 = :sys.get_state(shard_pid)
@@ -465,7 +458,6 @@ defmodule Anoma.Node.Examples.EShard do
 
     # --- Advance Read Watermark Again (Clean up entry 17) ---
     send(shard_pid, {:read_watermark_advanced, key, 34})
-    Process.sleep(50)
 
     # --- Direct State Check (Final) ---
     state5 = :sys.get_state(shard_pid)
@@ -481,14 +473,14 @@ defmodule Anoma.Node.Examples.EShard do
     refute Map.has_key?(kv5, 15)
     refute Map.has_key?(kv5, 17)
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
   I test various scenarios of reservation acquisition failures due to watermarks,
   existing values, and successful re-acquisition of existing reservations.
   """
-  @spec test_reserve_failures_and_reacquisition() :: :ok
+  @spec test_reserve_failures_and_reacquisition() :: Shard.t()
   def test_reserve_failures_and_reacquisition() do
     node_id = "test_shard_reserve_failures_node"
     shard_id = :test_shard_reserve_failures
@@ -502,8 +494,6 @@ defmodule Anoma.Node.Examples.EShard do
     # --- Setup Watermarks ---
     send(shard_pid, {:read_watermark_advanced, key, 10})
     send(shard_pid, {:write_watermark_advanced, key, 10})
-    # Allow messages to process
-    Process.sleep(50)
 
     # --- Test Reserving Below Watermarks (Height 5) ---
     assert Shard.reserve(shard_via, key, 5, :read) ==
@@ -572,7 +562,7 @@ defmodule Anoma.Node.Examples.EShard do
     assert kv_after_blocking[20].read_reserved?
     assert !kv_after_blocking[20].write_reserved?
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
@@ -580,7 +570,7 @@ defmodule Anoma.Node.Examples.EShard do
   (at a height lower than the height of the value the read depends on)
   is still held. This verifies a fix for overly broad write reservation blocking.
   """
-  @spec test_read_past_old_write_reserve() :: :ok
+  @spec test_read_past_old_write_reserve() :: Shard.t()
   def test_read_past_old_write_reserve() do
     node_id = "test_shard_read_past_reservation_node"
     shard_id = :test_shard_read_past_reservation
@@ -621,14 +611,14 @@ defmodule Anoma.Node.Examples.EShard do
     state = :sys.get_state(shard_pid)
     assert state.kv[key][h_reserve].write_reserved?
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
   I test writing to an initially empty shard, advancing the write watermark,
   and then performing reads both below and above the write height.
   """
-  @spec test_write_then_reads_empty_start() :: :ok
+  @spec test_write_then_reads_empty_start() :: Shard.t()
   def test_write_then_reads_empty_start() do
     node_id = "test_shard_empty_start_rw_node"
     shard_id = :test_shard_empty_start_rw
@@ -650,8 +640,6 @@ defmodule Anoma.Node.Examples.EShard do
 
     # 2. Advance write watermark past the write and reads
     send(shard_pid, {:write_watermark_advanced, key, wm_height})
-    # Allow message processing
-    Process.sleep(50)
 
     # 3. Read at height_absent (should be absent as latest < 5 is nothing)
     assert :ok == Shard.reserve(shard_via, key, read_height_absent, :read)
@@ -661,7 +649,7 @@ defmodule Anoma.Node.Examples.EShard do
     assert :ok == Shard.reserve(shard_via, key, read_height_ok, :read)
     assert Shard.read(shard_via, key, read_height_ok) == {:ok, write_value}
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
@@ -669,7 +657,7 @@ defmodule Anoma.Node.Examples.EShard do
   for key "b" at multiple heights, then unreserving at a specific height and verifying that only
   those reservations are released.
   """
-  @spec test_unreserve() :: :ok
+  @spec test_unreserve() :: Shard.t()
   def test_unreserve() do
     node_id = "test_shard_unreserve_node"
     shard_id = :test_shard_unreserve
@@ -718,9 +706,6 @@ defmodule Anoma.Node.Examples.EShard do
     # Unreserve at height 3
     assert :ok == Shard.unreserve(shard_via, 3)
 
-    # Give the unreserve message time to process
-    Process.sleep(50)
-
     # Verify that only height 3 reservations were removed
     state_after_unreserve = :sys.get_state(shard_pid)
 
@@ -750,14 +735,14 @@ defmodule Anoma.Node.Examples.EShard do
       assert b_heights_after[height].write_reserved?
     end)
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
   I test that GC preserves the latest *committed* state below the read
   watermark, even if a later read reservation was acquired and released.
   """
-  @spec test_gc_preserves_committed_state_before_watermark() :: :ok
+  @spec test_gc_preserves_committed_state_before_watermark() :: Shard.t()
   def test_gc_preserves_committed_state_before_watermark() do
     node_id = "gc_preserve_node"
     key = "gc_preserve_test"
@@ -780,8 +765,6 @@ defmodule Anoma.Node.Examples.EShard do
 
     # 4. Advance read watermark past height 3 and 4, triggering GC
     send(shard_pid, {:read_watermark_advanced, key, 5})
-    # Allow GC to run
-    Process.sleep(50)
 
     # 5. Verify state
     state = :sys.get_state(shard_pid)
@@ -798,8 +781,7 @@ defmodule Anoma.Node.Examples.EShard do
     assert is_nil(details_h4),
            "State at height 4 should be GC'd"
 
-    assert :ok == GenServer.stop(shard_pid)
-    :ok
+    :sys.get_state(shard_pid)
   end
 
   @doc """
@@ -807,7 +789,7 @@ defmodule Anoma.Node.Examples.EShard do
   allowing a previously blocked read (blocked by the reservation, not the watermark)
   to complete.
   """
-  @spec test_unreserve_triggers_pending_read() :: :ok
+  @spec test_unreserve_triggers_pending_read() :: Shard.t()
   def test_unreserve_triggers_pending_read() do
     node_id = "test_shard_unreserve_trigger_node"
     shard_id = :test_shard_unreserve_trigger
@@ -842,8 +824,6 @@ defmodule Anoma.Node.Examples.EShard do
 
     # 5. Advance Write Watermark (enough for h_read, but still blocked by reservation)
     send(shard_pid, {:write_watermark_advanced, key, wm_height})
-    # Allow time for watermark message processing
-    Process.sleep(50)
 
     # 6. Verify Read is Still Blocked (yield returns nil if task hasn't finished)
     assert Task.yield(read_task, 100) == nil,
@@ -860,6 +840,6 @@ defmodule Anoma.Node.Examples.EShard do
     assert result == {:ok, write_value},
            "Read should have resolved to #{write_value} after unreserve"
 
-    :ok
+    :sys.get_state(shard_pid)
   end
 end

@@ -25,15 +25,8 @@ defmodule Anoma.Node.Transaction.ShardRouter do
   @typedoc "I represent a key managed by a shard."
   @type key_t :: binary()
 
-  @typedoc "I am the arguments passed to start_link. Requires node_id."
-  @type args_t :: [node_id: String.t()]
-
-  ############################################################
-  #                       Constants                          #
-  ############################################################
-
-  # The ETS table is created and owned by the ShardSupervisor, but I read from it.
-  @ets_table_name :shard_key_map
+  @typedoc "I am the arguments passed to start_link. Requires node_id and tid."
+  @type args_t :: [node_id: String.t(), tid: :ets.tab()]
 
   ############################################################
   #                    Public Client API                     #
@@ -57,10 +50,11 @@ defmodule Anoma.Node.Transaction.ShardRouter do
   in the ETS table (`:shard_key_map`).
   I return `{:ok, shard_label}` if the key is found, otherwise `:error`.
   """
-  @spec get_shard_label(key :: key_t()) ::
+  @spec get_shard_label(node_id :: String.t(), key :: key_t()) ::
           {:ok, atom()} | :error
-  def get_shard_label(key) when is_binary(key) do
-    GenServer.call(__MODULE__, {:get_shard_label, key})
+  def get_shard_label(node_id, key) when is_binary(key) do
+    target_process = Registry.via(node_id, __MODULE__)
+    GenServer.call(target_process, {:get_shard_label, key})
   end
 
   ############################################################
@@ -71,26 +65,34 @@ defmodule Anoma.Node.Transaction.ShardRouter do
   @doc """
   I initialize the ShardRouter GenServer.
   """
-  @spec init(args :: args_t()) :: {:ok, :no_state}
+  @spec init(args :: args_t()) :: {:ok, %{tid: :ets.tab()}}
   def init(args) do
     node_id = Keyword.fetch!(args, :node_id)
+    ets_tid = Keyword.fetch!(args, :tid)
     Process.set_label({__MODULE__, node_id})
-    Logger.debug("ShardRouter #{node_id} started.")
-    {:ok, :no_state}
+
+    Logger.debug(
+      "ShardRouter #{node_id} started with ETS tid: #{inspect(ets_tid)}."
+    )
+
+    {:ok, %{tid: ets_tid}}
   end
 
   @impl true
   @doc """
   I handle the `:get_shard_label` request.
 
-  I perform the lookup in the shared `:shard_key_map` ETS table.
+  I perform the lookup in the shared ETS table using the `tid` from the state.
   I return the shard label (atom) stored in the table.
   """
-  @spec handle_call({:get_shard_label, key_t()}, GenServer.from(), :no_state) ::
-          {:reply, {:ok, atom()} | :error, :no_state}
-  def handle_call({:get_shard_label, key}, _from, state) do
+  @spec handle_call({:get_shard_label, key_t()}, GenServer.from(), %{
+          tid: :ets.tab()
+        }) ::
+          {:reply, {:ok, atom()} | :error, %{tid: :ets.tab()}}
+  def handle_call({:get_shard_label, key}, _from, state = %{tid: ets_tid}) do
     try do
-      lookup_result = :ets.lookup(@ets_table_name, key)
+      # Use the tid from the state for the lookup
+      lookup_result = :ets.lookup(ets_tid, key)
 
       reply =
         case lookup_result do
@@ -107,15 +109,5 @@ defmodule Anoma.Node.Transaction.ShardRouter do
 
         {:reply, :error, state}
     end
-  end
-
-  @impl true
-  @doc """
-  I clean up the ETS table when I (the router) terminate.
-  """
-  @spec terminate(reason :: any(), state :: :no_state) :: :ok
-  def terminate(_reason, _state) do
-    :ets.delete(@ets_table_name)
-    :ok
   end
 end
