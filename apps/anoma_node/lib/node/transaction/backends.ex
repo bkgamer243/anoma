@@ -261,10 +261,7 @@ defmodule Anoma.Node.Transaction.Backends do
                              shard_pids
                            ) do
                         {:ok, backend_res} ->
-                          Ordering.transaction_completed(
-                            node_id,
-                            id
-                          )
+                          transaction_finished_event(id, node_id, false)
 
                           {:ok, backend_res}
 
@@ -282,10 +279,7 @@ defmodule Anoma.Node.Transaction.Backends do
                         "Transaction #{inspect(id)} failed: VM execution stage 2 error."
                       )
 
-                      Ordering.transaction_failed(
-                        node_id,
-                        id
-                      )
+                      transaction_finished_event(id, node_id, true)
 
                       :error
                   end
@@ -541,7 +535,7 @@ defmodule Anoma.Node.Transaction.Backends do
           end)
 
           # Notify Ordering transaction failed - IMPORTANT
-          Ordering.transaction_failed(node_id, id)
+          transaction_finished_event(id, node_id, true)
           :error
         end
     end
@@ -1084,5 +1078,16 @@ defmodule Anoma.Node.Transaction.Backends do
   @spec anoma_keyspace(String.t()) :: list(String.t())
   defp anoma_keyspace(key) do
     ["anoma", key]
+  end
+
+  @spec transaction_finished_event(binary(), String.t(), boolean()) :: :ok
+  defp transaction_finished_event(id, node_id, failed?) do
+    event =
+      Node.Event.new_with_body(node_id, %Ordering.TransactionFinishedEvent{
+        tx_id: id,
+        failed?: failed?
+      })
+
+    EventBroker.event(event)
   end
 end

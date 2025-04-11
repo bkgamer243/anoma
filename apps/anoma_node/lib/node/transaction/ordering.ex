@@ -131,9 +131,32 @@ defmodule Anoma.Node.Transaction.Ordering do
     field(:tx_id, binary())
   end
 
+  typedstruct enforce: true, module: TransactionFinishedEvent do
+    @typedoc """
+    I am the type of a transaction finished Event.
+
+    I am sent when a transaction associated with the tx_id has finished its shard storage logic or reservation release, either successfully or with failure.
+
+    ### Fields
+
+    - `tx_id` - The ID of the transaction which finished.
+    - `failed?` - Boolean indicating if the transaction failed.
+    """
+    field(:tx_id, binary())
+    field(:failed?, boolean())
+  end
+
   deffilter TxIdFilter, tx_id: binary() do
     %EventBroker.Event{body: %Node.Event{body: %{tx_id: ^tx_id}}} -> true
     _ -> false
+  end
+
+  deffilter TransactionFinishedFilter do
+    %EventBroker.Event{body: %Node.Event{body: %TransactionFinishedEvent{}}} ->
+      true
+
+    _ ->
+      false
   end
 
   @doc """
@@ -163,9 +186,17 @@ defmodule Anoma.Node.Transaction.Ordering do
   def init(args) do
     Process.set_label(__MODULE__)
 
+    node_id = Keyword.fetch!(args, :node_id)
+
     args = Keyword.validate!(args, [:node_id, next_height: 1])
 
     state = struct(Ordering, Enum.into(args, %{}))
+
+    # Subscribe to completion and failure events
+    EventBroker.subscribe_me([
+      Node.Event.node_filter(node_id),
+      %Anoma.Node.Transaction.Ordering.TransactionFinishedFilter{}
+    ])
 
     {:ok, state}
   end
@@ -314,33 +345,6 @@ defmodule Anoma.Node.Transaction.Ordering do
     )
   end
 
-  @doc """
-  I am the Ordering transaction_completed function.
-
-  I receive a Node ID, a transaction ID, its height.
-  For completed transactions, I update watermarks for keys that were reserved.
-  """
-  @spec transaction_completed(String.t(), binary()) :: :ok
-  def transaction_completed(node_id, id) do
-    GenServer.cast(
-      Registry.via(node_id, __MODULE__),
-      {:transaction_completed, id}
-    )
-  end
-
-  @doc """
-  I am the Ordering transaction_failed function.
-
-  For failed transactions, I release all reservations and clean up state.
-  """
-  @spec transaction_failed(String.t(), binary()) :: :ok
-  def transaction_failed(node_id, id) do
-    GenServer.cast(
-      Registry.via(node_id, __MODULE__),
-      {:transaction_failed, id}
-    )
-  end
-
   ############################################################
   #                      Public Filters                      #
   ############################################################
@@ -388,16 +392,20 @@ defmodule Anoma.Node.Transaction.Ordering do
     {:noreply, handle_order(tx_id_list, state)}
   end
 
-  def handle_cast({:transaction_completed, id}, state) do
-    {:noreply, handle_transaction_finished(id, state)}
-  end
-
-  def handle_cast({:transaction_failed, id}, state) do
-    {:noreply, handle_transaction_finished(id, state, failed: true)}
-  end
-
   def handle_cast(_msg, state) do
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(
+        %EventBroker.Event{
+          body: %Node.Event{
+            body: %TransactionFinishedEvent{tx_id: id, failed?: failed?}
+          }
+        },
+        state
+      ) do
+    {:noreply, handle_transaction_finished(id, state, failed: failed?)}
   end
 
   @impl true
@@ -657,7 +665,7 @@ defmodule Anoma.Node.Transaction.Ordering do
   end
 
   @spec handle_transaction_finished(binary(), t(), Keyword.t()) :: t()
-  defp handle_transaction_finished(tx_id, state, opts \\ []) do
+  defp handle_transaction_finished(tx_id, state, opts) do
     failed? = Keyword.get(opts, :failed, false)
 
     case Map.fetch(state.tx_reservations, tx_id) do
