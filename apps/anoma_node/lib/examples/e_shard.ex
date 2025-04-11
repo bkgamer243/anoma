@@ -85,6 +85,10 @@ defmodule Anoma.Node.Examples.EShard do
         Shard.read(shard_via, key, height)
       end)
 
+    # 2.5 Verify the read task is initially blocked
+    assert Task.yield(read_task, 100) == nil,
+           "Read task should be blocked before watermark advances"
+
     # 3. Advance the watermark *after* the read call is blocked
     send(shard_pid, {:write_watermark_advanced, key, height + 1})
 
@@ -132,6 +136,10 @@ defmodule Anoma.Node.Examples.EShard do
       Task.async(fn ->
         Shard.read(shard_via, key, read_height)
       end)
+
+    # 2.5 Verify the read task is initially blocked
+    assert Task.yield(read_task, 100) == nil,
+           "Read task should be blocked initially"
 
     # 3. Acquire Write Reservation for an intermediate height BEFORE watermark advances
     assert :ok == Shard.reserve(shard_via, key, write_height, :write)
@@ -192,6 +200,10 @@ defmodule Anoma.Node.Examples.EShard do
         Shard.read(shard_via, key, height)
       end)
 
+    # 2.5 Verify the read task is initially blocked
+    assert Task.yield(read_task, 100) == nil,
+           "Read task should be blocked before trying to await with timeout"
+
     # 3. DO NOT advance the watermark
 
     # 4. Await the result with a short timeout
@@ -251,6 +263,13 @@ defmodule Anoma.Node.Examples.EShard do
       Task.async(fn ->
         Shard.read(shard_via, key, read_height_timeout)
       end)
+
+    # 2.5 Verify both tasks are initially blocked
+    assert Task.yield(read_task_ok, 100) == nil,
+           "Read task (ok) should be blocked initially"
+
+    assert Task.yield(read_task_timeout, 100) == nil,
+           "Read task (timeout) should be blocked initially"
 
     # 3. Advance Watermark partially (enough for height 5, not for 15)
     send(shard_pid, {:write_watermark_advanced, key, watermark_height})
@@ -821,6 +840,10 @@ defmodule Anoma.Node.Examples.EShard do
       Task.async(fn ->
         Shard.read(shard_via, key, h_read)
       end)
+
+    # 4.5 Verify the read task is initially blocked (before watermark advance)
+    assert Task.yield(read_task, 100) == nil,
+           "Read task should be blocked initially by reservation"
 
     # 5. Advance Write Watermark (enough for h_read, but still blocked by reservation)
     send(shard_pid, {:write_watermark_advanced, key, wm_height})
