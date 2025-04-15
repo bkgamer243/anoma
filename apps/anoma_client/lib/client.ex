@@ -9,7 +9,6 @@ defmodule Anoma.Client do
   alias Anoma.Client.Node.GRPCProxy
   alias Anoma.Client.Runner
   alias Anoma.Client.Transactions
-  alias Phoenix.PubSub
 
   use TypedStruct
 
