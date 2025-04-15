@@ -7,25 +7,30 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
   (`:shard_key_map`) mapping keys to the registered name
   (`{:via, Registry, {Anoma.Node, {Shard, key}}}`) of the `Shard` process
   responsible for that key. The actual lookup of keys is handled by the
-  `Anoma.Node.Transaction.ShardRouter`.
+  `Anoma.Node.Transaction.Ordering`.
 
   ### Key Concepts
 
   - **Supervisor Args:** Keyword list including `:strategy` and `:schema`.
   - **Strategy:** Determines how shards are created (e.g., `:one_per_key`).
   - **Schema:** Defines the initial keys and their starting values.
-  - **ETS Table:** `:shard_key_map` for key -> shard name lookup (used by ShardRouter).
+  - **ETS Table:** `:shard_key_map` for key -> shard name lookup (used by Anoma.Node.Transaction.Ordering).
 
   ### Public API
 
   - `start_link/1`: I start the supervisor.
+  - `get_shard_key_map/1`: I return the ETS table for the shard key map for the given node ID.
   """
 
   use Supervisor
 
   alias Anoma.Node.Registry
   alias Anoma.Node.Transaction.Shard
-  alias Anoma.Node.Transaction.ShardRouter
+
+  require Logger
+
+  # ETS table name for storing the shard key map
+  @shard_key_map_ets :shard_key_map
 
   ############################################################
   #                       Types                              #
@@ -92,9 +97,8 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
 
   I set the process label. If valid :strategy and :schema are provided,
   I calculate the full key->name mapping and shard child specs,
-  populate the `:shard_key_map` ETS table, and then start the
-  `ShardRouter` and all configured `Shard` children using a
-  `:one_for_one` strategy.
+  populate a named ETS table with key -> shard ID mappings, and
+  start all configured `Shard` children using a `:one_for_one` strategy.
   """
   @spec init(args :: supervisor_args_t()) ::
           {:ok, {Supervisor.sup_flags(), [Supervisor.child_spec()]}}
@@ -112,13 +116,10 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
         )
 
       # Create ETS table if shards were generated
-      case create_and_populate_ets_table(key_to_id_map) do
-        {:ok, ets_tid} ->
-          # Define router child spec, passing the ETS table ID
-          router_child_spec = {ShardRouter, [node_id: node_id, tid: ets_tid]}
-          all_children = [router_child_spec | shard_child_specs]
-
-          Supervisor.init(all_children, strategy: :one_for_one)
+      case create_and_populate_ets_table(key_to_id_map, node_id) do
+        {:ok, _ets_tid} ->
+          # Simply initialize the supervisor with the child specs
+          Supervisor.init(shard_child_specs, strategy: :one_for_one)
 
         :no_shards ->
           # No shards configured or generated, start no children
@@ -198,17 +199,43 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
     {[], %{}}
   end
 
+  @doc """
+  I return the ETS table for the shard key map for the given node ID.
+  """
+  @spec get_shard_key_map(node_id :: String.t()) :: :ets.tab() | nil
+  def get_shard_key_map(node_id) do
+    table_name = :"#{@shard_key_map_ets}_#{node_id}"
+
+    case :ets.whereis(table_name) do
+      :undefined -> nil
+      tid -> tid
+    end
+  end
+
   # Creates a new ETS table and populates it with the key -> shard_id mapping.
   # Returns {:ok, tid} on success, :no_shards if the map is empty, or {:error, reason}.
-  @spec create_and_populate_ets_table(map :: %{key_t() => atom()}) ::
+  @spec create_and_populate_ets_table(
+          map :: %{key_t() => atom()},
+          node_id :: String.t()
+        ) ::
           {:ok, :ets.tab()} | :no_shards | {:error, any()}
-  defp create_and_populate_ets_table(key_to_id_map)
+  defp create_and_populate_ets_table(key_to_id_map, node_id)
        when map_size(key_to_id_map) > 0 do
     try do
+      # Create a named ETS table for this node
+      table_name = :"#{@shard_key_map_ets}_#{node_id}"
+
+      # Check if table already exists, if so delete it
+      case :ets.whereis(table_name) do
+        :undefined -> :ok
+        _ -> :ets.delete(table_name)
+      end
+
       ets_tid =
-        :ets.new(:_, [
+        :ets.new(table_name, [
           :set,
-          :public
+          :public,
+          :named_table
         ])
 
       Enum.each(key_to_id_map, fn {key, shard_id} ->
@@ -223,7 +250,7 @@ defmodule Anoma.Node.Transaction.ShardSupervisor do
     end
   end
 
-  defp create_and_populate_ets_table(_empty_map) do
+  defp create_and_populate_ets_table(_empty_map, _node_id) do
     :no_shards
   end
 end

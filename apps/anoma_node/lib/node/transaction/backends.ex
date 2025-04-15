@@ -18,11 +18,11 @@ defmodule Anoma.Node.Transaction.Backends do
   alias Anoma.Node.Transaction.Executor
   alias Anoma.Node.Transaction.Ordering
   alias Anoma.Node.Transaction.Storage
-  alias Anoma.Node.Transaction.Shard
   alias Anoma.TransparentResource
   alias Anoma.TransparentResource.Resource, as: TResource
   alias Anoma.TransparentResource.Transaction, as: TTransaction
 
+  require Logger
   require Node.Event
   require Noun
 
@@ -30,6 +30,8 @@ defmodule Anoma.Node.Transaction.Backends do
 
   use EventBroker.DefFilter
   use TypedStruct
+
+  @type vm_result() :: {:ok, Noun.t()} | :error | :vm_error
 
   @type backend() ::
           :debug_term_storage
@@ -146,9 +148,19 @@ defmodule Anoma.Node.Transaction.Backends do
              back: backend()
   def execute(node_id, {backend, tx_code}, id) do
     if backend == :shard_storage do
-      execute_shard_storage(node_id, tx_code, id, backend)
+      # --- Shard Storage Backend ---
+      case execute_shard_storage(node_id, tx_code, id) do
+        {:ok, vm_result} ->
+          transaction_finished_event(id, node_id, false, vm_result, backend)
+
+        {:error, vm_result} ->
+          transaction_finished_event(id, node_id, true, vm_result, backend)
+      end
+
+      # Maintain original behavior of execute/3 always returning :ok
+      :ok
     else
-      # For non-shard backends
+      # --- Non-Shard Backends ---
       time = Storage.current_time(node_id)
 
       scry =
@@ -203,131 +215,68 @@ defmodule Anoma.Node.Transaction.Backends do
   @spec execute_shard_storage(
           String.t(),
           Noun.t(),
-          binary(),
-          backend()
-        ) :: :ok
-  defp execute_shard_storage(node_id, tx_code, id, backend) do
+          binary()
+        ) :: {:ok, vm_result()} | {:error, vm_result()}
+  defp execute_shard_storage(node_id, tx_code, id) do
     # For shard storage, first extract reservations
     case vm_execute_stage1(tx_code) do
       {:ok, {stage_2_tx, reservations}} ->
         case parse_reservations(reservations) do
           {:ok, parsed_reservations} ->
-            # Request reservations from Ordering
-            case Ordering.request_reservations(
-                   node_id,
-                   id,
-                   parsed_reservations
-                 ) do
-              {:ok, {height, shard_pids}} ->
-                # Update scry function with height
-                # Nock VM passes the evaluated key noun directly to the scry function
-                shard_scry =
-                  fn key_noun ->
-                    binary_key = Noun.atom_integer_to_binary(key_noun)
-
-                    case Map.fetch(shard_pids, binary_key) do
-                      {:ok, pid} ->
-                        case Shard.read(
-                               pid,
-                               binary_key,
-                               height
-                             ) do
-                          {:ok, value} -> {:ok, value}
-                          :absent -> :absent
-                          _ -> :error
-                        end
-
-                      :error ->
-                        :error
-                    end
-                  end
-
-                shard_env = %Nock{scry_function: shard_scry}
-
-                # Execute the rest with reservations
-                vm_result = vm_execute_stage2(stage_2_tx, id, shard_env)
-                result_event(id, vm_result, node_id, backend)
-
-                # Process the result and handle completion/failure notification
-                res =
-                  case vm_result do
-                    {:ok, vm_res} ->
-                      # Try to store the result using shard logic
-                      case shard_storage_logic(
-                             node_id,
-                             id,
-                             vm_res,
-                             height,
-                             shard_pids
-                           ) do
-                        {:ok, backend_res} ->
-                          transaction_finished_event(id, node_id, false)
-
-                          {:ok, backend_res}
-
-                        :error ->
-                          # Shard logic failed
-                          # Do not call transaction_failed here, it was done in shard_storage_logic
-                          :error
-                      end
-
-                    :vm_error ->
-                      # VM stage 2 failed
-                      Logging.log_event(
-                        node_id,
-                        :error,
-                        "Transaction #{inspect(id)} failed: VM execution stage 2 error."
-                      )
-
-                      transaction_finished_event(id, node_id, true)
-
-                      :error
-                  end
-
-                # end case vm_result
-
-                # Notify Executor about the final result (:ok/:error)
-                complete_event(id, res, node_id, backend)
-
-                :ok
-
-              {:error, reason} ->
-                # Reservation failed
-                Logging.log_event(
-                  node_id,
-                  :error,
-                  "Transaction #{inspect(id)} failed: Could not acquire reservations. Reason: #{inspect(reason)}"
-                )
-
-                # No need to call transaction_failed here
-                # as Ordering handles failed reservation attempts internally.
-                # Tell mempool VM step failed
-                result_event(id, :vm_error, node_id, backend)
-                # Tell executor overall failed
-                complete_event(id, :error, node_id, backend)
-                :ok
-            end
-
-          {:error, reason} ->
-            # Invalid reservation format
-            # No need to call transaction_failed here
-            # as no reservations were successfully acquired
-            Logging.log_event(
+            # Asynchronously request reservations from Ordering
+            Ordering.request_reservations(
               node_id,
-              :error,
-              "Invalid reservation format: #{inspect(reason)}"
+              id,
+              parsed_reservations
             )
 
-            result_event(id, :vm_error, node_id, backend)
-            complete_event(id, :error, node_id, backend)
+            shard_scry =
+              fn key_noun ->
+                binary_key = Noun.atom_integer_to_binary(key_noun)
+
+                # Use Ordering.shard_read instead of direct shard access
+                case Ordering.shard_read(node_id, {id, binary_key}) do
+                  {:ok, value} -> {:ok, value}
+                  :absent -> :absent
+                  _ -> :error
+                end
+              end
+
+            shard_env = %Nock{scry_function: shard_scry}
+
+            # Execute the rest with reservations
+            vm_result =
+              try do
+                vm_execute_stage2(stage_2_tx, id, shard_env)
+              rescue
+                _e ->
+                  :vm_error
+              catch
+                _kind, _value ->
+                  :vm_error
+              end
+
+            # Process the result and handle completion/failure notification
+            case vm_result do
+              {:ok, vm_res} ->
+                case shard_storage_logic(node_id, id, vm_res) do
+                  {:ok, _backend_res} -> {:ok, vm_result}
+                  _error -> {:error, vm_result}
+                end
+
+              :vm_error ->
+                # Stage 2 execution failed
+                {:error, :vm_error}
+            end
+
+          {:error, _reason} ->
+            # Invalid reservation format
+            {:error, :vm_error}
         end
 
       _error ->
         # Stage 1 execution failed
-        # No need to call transaction_failed here
-        # as no reservations were successfully acquired
-        result_event(id, :vm_error, node_id, backend)
-        complete_event(id, :error, node_id, backend)
+        {:error, :vm_error}
     end
   end
 
@@ -479,32 +428,21 @@ defmodule Anoma.Node.Transaction.Backends do
 
   # Handle shard storage transactions after vm execution
   # Expects result to be an improper list of [key | value] pairs.
-  @spec shard_storage_logic(String.t(), binary(), Noun.t(), integer(), %{
-          binary() => pid()
-        }) ::
+  # Transaction height is managed internally by Ordering.shard_write
+  @spec shard_storage_logic(String.t(), binary(), Noun.t()) ::
           {:ok, any()} | :error
-  defp shard_storage_logic(node_id, id, result_noun, height, shard_pids) do
+  defp shard_storage_logic(node_id, id, result_noun) do
     # Parse the improper list of write operations
     case parse_writes(result_noun) do
       {:ok, kvlist} ->
-        # Try writing to shards, track failures
+        # Try writing to shards using Ordering.shard_write, track failures
         write_results =
           Enum.map(kvlist, fn {k_noun, v_noun} ->
             key_bin = Noun.atom_integer_to_binary(k_noun)
 
-            case Map.fetch(shard_pids, key_bin) do
-              {:ok, pid} ->
-                case Shard.write(pid, key_bin, v_noun, height) do
-                  :ok ->
-                    {:ok, key_bin}
-
-                  {:error, reason} ->
-                    {:error, {key_bin, :write_failed, reason}}
-                end
-
-              :error ->
-                # Key not found in reserved pids (shouldn't happen if reservation succeeded)
-                {:error, {key_bin, :pid_not_found}}
+            # Use Ordering.shard_write instead of direct shard access
+            case Ordering.shard_write(node_id, {id, key_bin, v_noun}) do
+              :ok -> {:ok, key_bin}
             end
           end)
 
@@ -513,29 +451,8 @@ defmodule Anoma.Node.Transaction.Backends do
           Enum.filter(write_results, fn {status, _} -> status == :error end)
 
         if Enum.empty?(failed_writes) do
-          # All writes succeeded
-          # Return original noun on success
           {:ok, result_noun}
         else
-          # Log detailed errors for each failure
-          Enum.each(failed_writes, fn
-            {:error, {key, :write_failed, reason}} ->
-              Logging.log_event(
-                node_id,
-                :error,
-                "Shard write failed for tx #{inspect(id)}, key #{inspect(key)}: Write error - #{inspect(reason)}"
-              )
-
-            {:error, {key, :pid_not_found}} ->
-              Logging.log_event(
-                node_id,
-                :error,
-                "Shard write failed for tx #{inspect(id)}, key #{inspect(key)}: Shard PID not found in reservations"
-              )
-          end)
-
-          # Notify Ordering transaction failed - IMPORTANT
-          transaction_finished_event(id, node_id, true)
           :error
         end
     end
@@ -962,6 +879,10 @@ defmodule Anoma.Node.Transaction.Backends do
           backend()
         ) :: :ok
   defp complete_event(id, result, node_id, backend) do
+    Logger.debug(
+      "[Backends #{node_id}] Preparing CompleteEvent for tx #{inspect(id)} with result #{inspect(result)}."
+    )
+
     event =
       Node.Event.new_with_body(node_id, %__MODULE__.CompleteEvent{
         tx_id: id,
@@ -1080,14 +1001,55 @@ defmodule Anoma.Node.Transaction.Backends do
     ["anoma", key]
   end
 
-  @spec transaction_finished_event(binary(), String.t(), boolean()) :: :ok
-  defp transaction_finished_event(id, node_id, failed?) do
-    event =
+  @spec transaction_finished_event(
+          binary(),
+          String.t(),
+          boolean(),
+          vm_result(),
+          backend()
+        ) :: :ok
+  defp transaction_finished_event(id, node_id, failed?, vm_result, backend) do
+    ordering_event =
       Node.Event.new_with_body(node_id, %Ordering.TransactionFinishedEvent{
         tx_id: id,
-        failed?: failed?
+        failed?: failed?,
+        vm_result: vm_result,
+        backend: backend
       })
 
-    EventBroker.event(event)
+    EventBroker.event(ordering_event)
+  end
+
+  # --- Public API for Ordering to trigger completion --- #
+
+  @doc """
+  I am called by the Ordering Engine to send the final completion
+  notifications (ResultEvent for Mempool, CompleteEvent for Executor)
+  after the transaction has been officially ordered and its completion status
+  is confirmed.
+  """
+  @spec notify_completion(
+          String.t(),
+          binary(),
+          vm_result(),
+          backend(),
+          boolean()
+        ) :: :ok
+  def notify_completion(node_id, tx_id, vm_result, backend, failed?) do
+    Logger.debug(
+      "[Backends #{node_id}] Entering notify_completion for tx #{inspect(tx_id)}. Failed?: #{failed?}"
+    )
+
+    # Send ResultEvent to Mempool
+    result_event(tx_id, vm_result, node_id, backend)
+
+    # Determine final completion result
+    # NOTE: The original code sent {:ok, nil} on success.
+    # We might need to revisit if the actual backend result is needed here.
+    # For now, replicating the old behavior.
+    final_result = if failed?, do: :error, else: {:ok, nil}
+
+    # Send CompleteEvent to Executor
+    complete_event(tx_id, final_result, node_id, backend)
   end
 end
