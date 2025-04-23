@@ -330,45 +330,45 @@ defmodule Anoma.Node.Transaction.Backends do
   """
   @spec parse_reservations(Noun.t()) ::
           {:ok, [{:read | :write, binary()}]} | {:error, atom()}
-  def parse_reservations(reservations) do
-    do_parse_reservations(reservations, [])
-  end
+  def parse_reservations(reservations_noun) do
+    with {:ok, noun_list} <- Noun.Nounable.List.from_noun(reservations_noun) do
+      # Map each potential pair to its result {:ok, reservation} or {:error, reason}
+      results =
+        Enum.map(noun_list, fn
+          [type_num | key_noun] = pair ->
+            process_reservation_pair(type_num, key_noun)
+            |> case do
+              {:ok, reservation} ->
+                {:ok, reservation}
 
-  # Helper for parsing reservation lists recursively
-  @spec do_parse_reservations(Noun.t(), [{:read | :write, binary()}]) ::
-          {:ok, [{:read | :write, binary()}]} | {:error, atom()}
-  defp do_parse_reservations(noun, acc) when Noun.is_noun_zero(noun) do
-    {:ok, acc}
-  end
+              {:error, reason} ->
+                {:error,
+                 {:invalid_reservation_pair_format,
+                  {reason, Noun.condensed_print(pair)}}}
+            end
 
-  defp do_parse_reservations(noun, acc) do
-    case noun do
-      # --- Recursive case: [ [type | key] | rest ] ---
-      [[type_num | key_noun] = head | rest] ->
-        case process_reservation_pair(type_num, key_noun) do
-          {:ok, reservation} ->
-            do_parse_reservations(rest, [reservation | acc])
-
-          {:error, reason} ->
+          invalid_pair ->
             {:error,
              {:invalid_reservation_pair_format,
-              {reason, Noun.condensed_print(head)}}}
-        end
+              {:not_a_pair, Noun.condensed_print(invalid_pair)}}}
+        end)
 
-      # --- Base case: Single pair [type | key] (end of improper list) ---
-      [type_num | key_noun] = pair ->
-        case process_reservation_pair(type_num, key_noun) do
-          {:ok, reservation} ->
-            {:ok, Enum.reverse([reservation | acc])}
+      # Check if any mapping resulted in an error
+      case Enum.find(results, fn {status, _} -> status == :error end) do
+        # No errors found
+        nil ->
+          # Extract values from {:ok, value} tuples
+          parsed_reservations = Enum.map(results, fn {:ok, val} -> val end)
+          {:ok, parsed_reservations}
 
-          {:error, reason} ->
-            {:error,
-             {:invalid_reservation_pair_format,
-              {reason, Noun.condensed_print(pair)}}}
-        end
-
-      # --- Invalid format ---
-      _invalid ->
+        # An error occurred during mapping
+        error_tuple ->
+          # Return the first error encountered
+          error_tuple
+      end
+    else
+      :error ->
+        # Error from Nounable.from_noun
         {:error, :invalid_reservation_format}
     end
   end
@@ -463,37 +463,42 @@ defmodule Anoma.Node.Transaction.Backends do
   # Helper to parse an improper list of [key | value] writes.
   @spec parse_writes(Noun.t()) ::
           {:ok, [{Noun.t(), Noun.t()}]} | {:error, atom}
-  defp parse_writes(noun) do
-    do_parse_writes(noun, [])
-  end
+  defp parse_writes(writes_noun) do
+    with {:ok, noun_list} <- Noun.Nounable.List.from_noun(writes_noun) do
+      # Map each potential pair, validating and returning {:ok, pair} or {:error, reason}
+      results =
+        Enum.map(noun_list, fn
+          [key_noun | value_noun] = pair ->
+            if Noun.is_noun_atom(key_noun) and not is_list(value_noun) do
+              {:ok, {key_noun, value_noun}}
+            else
+              {:error,
+               {:invalid_write_pair_format, Noun.condensed_print(pair)}}
+            end
 
-  @spec do_parse_writes(Noun.t(), [{Noun.t(), Noun.t()}]) ::
-          {:ok, [{Noun.t(), Noun.t()}]} | {:error, atom}
-  defp do_parse_writes(noun, acc) when Noun.is_noun_zero(noun) do
-    {:ok, acc}
-  end
+          invalid_pair ->
+            {:error,
+             {:invalid_write_pair_format,
+              {:not_a_pair, Noun.condensed_print(invalid_pair)}}}
+        end)
 
-  defp do_parse_writes(noun, acc) do
-    case noun do
-      # Recursive case: [ [key | value] | rest ]
-      [[key_noun | value_noun] = head | rest] ->
-        if Noun.is_noun_atom(key_noun) and not is_list(value_noun) do
-          do_parse_writes(rest, [{key_noun, value_noun} | acc])
-        else
-          {:error, {:invalid_write_pair_format, Noun.condensed_print(head)}}
-        end
+      # Check if any mapping resulted in an error
+      case Enum.find(results, fn {status, _} -> status == :error end) do
+        # No errors found
+        nil ->
+          # Extract values from {:ok, value} tuples
+          kv_list = Enum.map(results, fn {:ok, val} -> val end)
+          {:ok, kv_list}
 
-      # Base case: Single write [key | value] or improper list end
-      [key_noun | value_noun] = pair ->
-        # Basic validation similar to the recursive case
-        if Noun.is_noun_atom(key_noun) and not is_list(value_noun) do
-          {:ok, Enum.reverse([{key_noun, value_noun} | acc])}
-        else
-          {:error, {:invalid_write_pair_format, Noun.condensed_print(pair)}}
-        end
-
-      _ ->
-        {:error, {:invalid_write_format, Noun.condensed_print(noun)}}
+        # An error occurred during mapping
+        error_tuple ->
+          # Return the first error encountered
+          error_tuple
+      end
+    else
+      :error ->
+        # Error from Nounable.from_noun
+        {:error, :invalid_write_format}
     end
   end
 

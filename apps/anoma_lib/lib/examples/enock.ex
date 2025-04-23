@@ -2775,7 +2775,7 @@ defmodule Examples.ENock do
 
   @spec abc_list() :: Noun.t()
   def abc_list() do
-    [[0 | a_int()], [0 | b_int()] | [1 | c_int()]]
+    [[0 | a_int()], [0 | b_int()], [1 | c_int()] | 0]
   end
 
   ####################################################################
@@ -2784,8 +2784,8 @@ defmodule Examples.ENock do
 
   # Write Program Generator (writes a constant value to a key)
   def write_code_gen(key_int, value) do
-    reservations = [1 | key_int]
-    writes_logic = [1 | [key_int | value]]
+    reservations = [[1 | key_int] | 0]
+    writes_logic = [1 | [[key_int | value] | 0]]
     [[0 | 3] | [reservations | [writes_logic | [0 | 0]]]]
   end
 
@@ -2798,14 +2798,13 @@ defmodule Examples.ENock do
     key_b = b_int()
     key_c = c_int()
 
-    # [[0 | a], [0 | b] | [1 | c]]
     reservations = abc_list()
 
     scryA = [12 | [[1 | 0] | [1 | key_a]]]
     scryB = [12 | [[1 | 0] | [1 | key_b]]]
     addFormula = [4 | [4 | [4 | [4 | [0 | 2]]]]]
     sumFormula = [7 | [[scryA | scryB] | addFormula]]
-    writes_logic = [[1 | key_c] | sumFormula]
+    writes_logic = [[[1 | key_c] | sumFormula] | [1 | 0]]
 
     [[0 | 3] | [reservations | [writes_logic | [0 | 0]]]]
   end
@@ -2818,9 +2817,9 @@ defmodule Examples.ENock do
     key_a = a_int()
     key_b = b_int()
 
-    reservations = [[0 | key_a] | [1 | key_b]]
+    reservations = [[0 | key_a], [1 | key_b] | 0]
     scryA = [12 | [[1 | 0] | [1 | key_a]]]
-    writes_logic = [[1 | key_b] | scryA]
+    writes_logic = [[[1 | key_b] | scryA] | [1 | 0]]
 
     [[0 | 3] | [reservations | [writes_logic | [0 | 0]]]]
   end
@@ -2830,7 +2829,7 @@ defmodule Examples.ENock do
   """
   @spec crash_after_reserve_a() :: Noun.t()
   def crash_after_reserve_a() do
-    reservations = [1 | a_int()]
+    reservations = [[1 | a_int()] | 0]
     # Invalid Nock [0 | [0 | 0]] for the writes stage causes a crash
     [[0 | 3] | [reservations | [0 | [0 | 0]]]]
   end
@@ -2845,8 +2844,8 @@ defmodule Examples.ENock do
     # Setup
     dummy_tx_id = "test_tx_id_1"
     tx_code = write_code_gen(a_int(), 3)
-    expected_reservations = [1 | a_int()]
-    expected_writes = [a_int() | 3]
+    expected_reservations = [[1 | a_int()] | 0]
+    expected_writes = [[a_int() | 3] | 0]
 
     # Stage 1: Execute the core using the backend's formula to extract reservations
     {:ok, stage1_result} = Nock.nock(tx_code, [9, 2, 0 | 1], %Nock{})
@@ -2882,7 +2881,7 @@ defmodule Examples.ENock do
     dummy_tx_id = "test_tx_id_3"
     tx_code = read_ab_write_c_sum()
     expected_reservations = abc_list()
-    expected_writes = [c_int() | 7]
+    expected_writes = [[c_int() | 7] | 0]
 
     # Stage 1: Execute the core using the backend's formula
     {:ok, [reservations | stage2_code]} =
